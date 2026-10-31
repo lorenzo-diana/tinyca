@@ -1,0 +1,7 @@
+{
+  "scenario": "well_formed_single_action",
+  "responses": [
+    {"content": "```bash\nls -la\n```\n"},
+    {"content": "Done."}
+  ]
+}

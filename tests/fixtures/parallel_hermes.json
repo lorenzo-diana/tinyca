@@ -1,0 +1,20 @@
+{
+  "scenario": "parallel_hermes",
+  "responses": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+        },
+        {
+          "id": "call_2",
+          "type": "function",
+          "function": {"name": "bash", "arguments": "{\"command\":\"pwd\"}"}
+        }
+      ]
+    },
+    {"content": "Both commands ran successfully."}
+  ]
+}

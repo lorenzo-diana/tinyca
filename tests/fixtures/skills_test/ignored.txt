@@ -1,0 +1,1 @@
+not a .sh file, must be ignored by discovery regardless of content

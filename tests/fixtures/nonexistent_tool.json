@@ -1,0 +1,12 @@
+{
+  "scenario": "nonexistent_tool",
+  "responses": [
+    {
+      "tool_calls": [{
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "frobnicate", "arguments": "{\"command\":\"ls\"}"}
+      }]
+    }
+  ]
+}

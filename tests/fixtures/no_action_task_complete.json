@@ -1,0 +1,6 @@
+{
+  "scenario": "no_action_task_complete",
+  "responses": [
+    {"content": "The task is already complete, nothing to do."}
+  ]
+}

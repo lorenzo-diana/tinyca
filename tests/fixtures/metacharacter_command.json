@@ -1,0 +1,6 @@
+{
+  "scenario": "metacharacter_command",
+  "responses": [
+    {"content": "```bash\nls; rm -rf /\n```\n"}
+  ]
+}

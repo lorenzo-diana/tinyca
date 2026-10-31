@@ -1,0 +1,8 @@
+{
+  "scenario": "repeated_failing_command",
+  "responses": [
+    {"content": "```bash\ncat /does/not/exist\n```\n"},
+    {"content": "```bash\ncat /does/not/exist\n```\n"},
+    {"content": "```bash\ncat /does/not/exist\n```\n"}
+  ]
+}

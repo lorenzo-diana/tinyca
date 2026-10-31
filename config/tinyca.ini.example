@@ -1,0 +1,155 @@
+# TinyCA configuration — SPEC.md §4.
+#
+# INI format: `key = value`, `#`/`;` comments, `[section]` headers, values
+# trimmed, no quoting, no \n-escaping in values. Precedence when loading:
+# CLI flag > this file > the built-in default shown on each line below.
+#
+# Copy this file to tinyca.ini (gitignored) and edit. A missing file is not
+# fatal -- TinyCA just logs a warning and runs on built-in defaults.
+
+[llm]
+# Scheme + host + port of the llama-server (or other OpenAI-compatible local
+# server) instance. Use an IP literal if the tinyca binary itself is
+# statically linked (NSS/hostname resolution is unavailable then).
+base_url = http://127.0.0.1:8080
+
+# Overridden automatically to /completion whenever protocol.enable_grammar is
+# true (SPEC.md §6.3) -- grammar is only honoured on the native completion
+# endpoint on this server. Leave this alone; it exists mainly so the
+# override has somewhere to write to.
+api_path = /v1/chat/completions
+
+# Echoed back to the server; arbitrary unless the server was started with an
+# explicit --alias.
+model_id = qwen2.5-coder-1.5b
+
+# Sent as "Authorization: Bearer <api_key>". llama-server ignores it; this
+# exists for other OpenAI-compatible local servers that might check it.
+api_key = none
+
+# Generous on purpose: this class of hardware generates at roughly 4-5
+# tokens/second, so a long reply can legitimately take minutes.
+request_timeout_s = 900
+connect_timeout_s = 10
+
+# Per-request generation cap.
+max_tokens = 512
+
+# Low temperature on purpose -- this is code, not prose.
+temperature = 0.2
+top_p = 0.9
+
+# Must match the server's own -c flag; used only for the >80% context-budget
+# warning and the hard abort past 100% (SPEC.md §9) -- never auto-summarised.
+context_tokens = 4096
+
+# SSE token streaming (SPEC.md §9.3). llama-server supports it on both
+# endpoints. Turn this off for scripted/oneshot invocations piping output
+# elsewhere, where incremental flushes add nothing -- or if talking to a
+# server that doesn't speak SSE (e.g. tools/mockllm in tests).
+stream = true
+
+[protocol]
+# fenced (default): the model emits one ```bash ... ``` block per turn.
+# hermes: parallel-capable, structured tool_calls (SPEC.md §6).
+tool_protocol = fenced
+
+# GBNF grammar constraint (SPEC.md §6.3). hermes only -- ignored with a
+# warning under tool_protocol=fenced. Forces api_path to /completion when on.
+enable_grammar = false
+grammar_file = grammars/hermes_tool_call.gbnf
+
+# Remove <think>...</think> before parsing actions, and (separately) before
+# replaying it in history. The transcript always gets the full reasoning
+# regardless of these two flags.
+strip_think = true
+strip_think_from_history = true
+
+# Comma-separated override for the protocol's own stop sequences. Leave
+# empty to use the protocol default (``` fences for fenced, </tool_call> for
+# hermes) -- there is rarely a good reason to change this.
+stop_sequences =
+
+[agent]
+# Multi-line prompts don't belong in an INI value -- this points at a plain
+# text file instead. The Tier 1 skills block (SPEC.md §7) is appended to it
+# automatically at startup.
+system_prompt_file = config/system_prompt.txt
+
+# Hard cap on loop turns per task.
+max_iterations = 8
+
+# Consecutive identical turns (same set of commands) before the loop aborts
+# -- small models can retry a failing command forever otherwise.
+repetition_threshold = 2
+
+# Execution jail for every bash command; created if it doesn't exist.
+work_dir = ./workspace
+
+# Append-only JSONL record of every request, response, command, and result
+# -- the only diagnostic available when something goes wrong on-device.
+transcript_log_path = ./logs/transcript.jsonl
+
+# Cap on the transcript file's size; 0 = unlimited. Once exceeded, one
+# cutoff line is written and further entries are dropped for the rest of
+# that run -- a safety valve for long interactive sessions on a device with
+# limited storage, not general log rotation.
+transcript_max_bytes = 0
+
+# error | warn | info | debug -- console logging verbosity. -v/--verbose
+# forces debug regardless of this value.
+log_level = info
+
+# interactive (REPL) | oneshot. Set to oneshot automatically by -p/--prompt.
+mode = interactive
+
+# auto (colour only when stdout is a real terminal) | always | never.
+color_output = auto
+
+[tools]
+# Per-command timeout; SIGKILL on expiry, targeting the whole process group
+# so a backgrounded grandchild can't outlive it.
+bash_timeout_s = 60
+
+# Output truncation (SPEC.md §8): keep the first N and last M lines with a
+# "... lines omitted ..." marker between them, then hard-cap total bytes.
+output_head_lines = 40
+output_tail_lines = 40
+output_max_bytes = 4096
+
+# whitelist (default, safest) | blacklist | none (SPEC.md §8.1).
+command_filter_mode = whitelist
+
+# Head tokens checked against command_filter_mode=whitelist. A discovered
+# skill's path is always allowed regardless of this list or the mode below.
+whitelist = ls,cat,grep,find,wc,head,tail,pwd,echo,mkdir,cp,mv,touch,make,gcc,g++,python3,git,sed,awk,diff,wget
+
+# Head tokens checked against command_filter_mode=blacklist.
+blacklist = rm,dd,mkfs,shutdown,reboot,sudo,su,chmod,chown,kill,pkill,killall,mount,umount
+
+# ask (default): prompt interactively, same shape as Claude Code's own
+# command-approval prompt -- allow runs it once, block tells the model the
+# *user* blocked it (distinct from an automatic filter denial).
+# deny: reject outright, no interaction, tell the model why.
+on_blocked_command = ask
+
+# always: also prompt before every command the filter already allowed
+# (belt-and-suspenders). never (default): skip that extra prompt -- the
+# filter and on_blocked_command are the safety net.
+confirm_mode = never
+
+# false (default, safe): reject $(), `, >, <, and a lone & outright, in
+# every command_filter_mode. true: allow them -- document any use of this
+# as unsafe, oneshot-sandbox-only.
+allow_metacharacters = false
+
+[skills]
+skills_dir = ./skills
+
+# Render the Tier 1 skills index into the system prompt (SPEC.md §7).
+tier1_enabled = true
+
+# Beyond this many discovered skills, small-model tool selection degrades;
+# extras are omitted from Tier 1 (not deleted -- still loadable via Tier 2's
+# show_skill: trigger) with a startup warning.
+max_tier1_skills = 8

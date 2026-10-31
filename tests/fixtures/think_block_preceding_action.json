@@ -1,0 +1,7 @@
+{
+  "scenario": "think_block_preceding_action",
+  "responses": [
+    {"content": "<think>\nThe user wants a file listing, I should run ls.\n</think>\n```bash\nls -la\n```\n"},
+    {"content": "Done."}
+  ]
+}

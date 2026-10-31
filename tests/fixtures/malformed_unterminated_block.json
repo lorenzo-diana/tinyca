@@ -1,0 +1,6 @@
+{
+  "scenario": "malformed_unterminated_block",
+  "responses": [
+    {"content": "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}"}
+  ]
+}
