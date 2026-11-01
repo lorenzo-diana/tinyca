@@ -2,21 +2,20 @@
 #include "tinyca/ini_parser.h"
 
 #include <fstream>
-#include <sstream>
 
 #include "tinyca/string_util.h"
 
 namespace tinyca
 {
 
-bool IniParser::parse_file(const std::string &path, std::map<std::string, std::string> &out,
+void IniParser::parse_file(const std::string &path, std::map<std::string, std::string> &out,
                            std::vector<std::string> &warnings, bool &file_found)
 {
     std::ifstream in(path.c_str());
     if (!in.is_open())
     {
         file_found = false;
-        return true;
+        return;
     }
     file_found = true;
 
@@ -53,9 +52,15 @@ bool IniParser::parse_file(const std::string &path, std::map<std::string, std::s
             warnings.push_back(path + ":" + std::to_string(line_no) + ": empty key");
             continue;
         }
-        out[section + "." + key] = value;
+        const std::string full_key = section + "." + key;
+        // Last-wins is kept (it is what every INI reader does), but silently
+        // dropping an earlier value hides a real editing mistake -- two
+        // different values for one key, one of which does nothing.
+        if (out.find(full_key) != out.end())
+            warnings.push_back(path + ":" + std::to_string(line_no) + ": duplicate key '" + full_key +
+                               "' overrides an earlier value");
+        out[full_key] = value;
     }
-    return true;
 }
 
 } // namespace tinyca

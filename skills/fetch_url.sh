@@ -1,7 +1,7 @@
 #!/bin/bash
 # @name: fetch_url
 # @description: Download a file from a URL into a destination folder using wget.
-# @usage: skills/fetch_url.sh <url> <destination_folder>
+# @usage: fetch_url.sh <url> <destination_folder>
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then

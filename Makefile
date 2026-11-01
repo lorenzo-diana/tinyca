@@ -5,6 +5,11 @@ CROSS     ?=
 CXXSTD    := -std=c++11
 WARN      := -Wall -Wextra
 BASEFLAGS := $(CXXSTD) -O2 $(WARN) -pthread
+# -MMD -MP emits a .d per object listing the headers it included, so editing a
+# header rebuilds everything that includes it. Without this, a changed struct
+# in include/tinyca/ left stale objects behind and the link produced a binary
+# whose translation units disagreed on layout.
+DEPFLAGS  := -MMD -MP
 INCLUDES  := -Iinclude -Ithird_party
 
 BUILD_DIR := build
@@ -29,7 +34,7 @@ $(BUILD_DIR)/tinyca: $(OBJS)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(BASEFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(BASEFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
 mock: $(BUILD_DIR)/mockllm
 
@@ -42,7 +47,9 @@ endif
 
 $(BUILD_DIR)/mockllm_obj/%.o: $(MOCK_SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(BASEFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(BASEFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+
+-include $(OBJS:.o=.d) $(MOCK_OBJS:.o=.d)
 
 test: all mock
 	@$(TEST_DIR)/run_tests.sh

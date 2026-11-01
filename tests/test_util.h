@@ -1,5 +1,5 @@
 // BSD 3-Clause License — see LICENSE at the repository root.
-// Minimal assert macro set -- no test framework dependency (PROMPT.md W2).
+// Minimal assert macro set -- no test framework dependency (dev/PROMPT.md W2).
 #pragma once
 
 #include <iostream>

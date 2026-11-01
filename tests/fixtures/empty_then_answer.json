@@ -1,0 +1,7 @@
+{
+  "scenario": "empty_then_answer",
+  "responses": [
+    {"content": ""},
+    {"content": "There are 3 files."}
+  ]
+}

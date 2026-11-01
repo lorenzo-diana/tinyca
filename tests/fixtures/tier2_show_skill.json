@@ -1,0 +1,7 @@
+{
+  "scenario": "tier2_show_skill",
+  "responses": [
+    {"content": "show_skill: fetch_url"},
+    {"content": "Now I know it uses wget -P."}
+  ]
+}

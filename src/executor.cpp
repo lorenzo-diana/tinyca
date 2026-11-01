@@ -8,7 +8,6 @@
 #include <unistd.h>
 
 #include <chrono>
-#include <cstring>
 #include <vector>
 
 #include "tinyca/string_util.h"
@@ -16,6 +15,15 @@
 namespace tinyca
 {
 
+// AUDIT NOTES (both visible in what the model is shown, and in the
+// transcript):
+//  - Output is rebuilt line by line with '\n' appended to each kept line, so
+//    the result is always newline-terminated even when the command's own
+//    output was not. Line counts, not bytes, decide what is kept.
+//  - The byte cap is applied after line selection by a plain resize(), so it
+//    can cut mid-line and mid-UTF-8-sequence. The result never exceeds
+//    max_bytes (the truncation marker is reserved for inside the cap), but a
+//    reviewer reading a truncated tail should not assume it is complete.
 std::string truncate_output(const std::string &full_output, int head_lines, int tail_lines, int max_bytes)
 {
     std::vector<std::string> lines = split(full_output, '\n');
@@ -53,10 +61,19 @@ std::string truncate_output(const std::string &full_output, int head_lines, int 
         }
     }
 
+    // max_bytes is a hard cap on the returned string (SPEC.md §8), so the
+    // marker has to fit INSIDE it: reserve its length first, then resize.
+    // A cap smaller than the marker itself yields the marker alone, still
+    // within the cap (an empty result would hide that anything was cut).
     if (max_bytes > 0 && out.size() > static_cast<size_t>(max_bytes))
     {
-        out.resize(static_cast<size_t>(max_bytes));
-        out += "\n... [truncated at output_max_bytes] ...\n";
+        const std::string marker = "\n... [truncated at output_max_bytes] ...\n";
+        const size_t cap = static_cast<size_t>(max_bytes);
+        const size_t keep = (cap > marker.size()) ? cap - marker.size() : 0;
+        out.resize(keep);
+        out += marker;
+        if (out.size() > cap)
+            out.resize(cap);
     }
     return out;
 }
@@ -67,6 +84,62 @@ Executor::Executor(std::string work_dir, int timeout_s, int output_head_lines, i
       tail_lines_(output_tail_lines), max_bytes_(output_max_bytes)
 {
 }
+
+void Executor::set_path_prepend(const std::string &dir)
+{
+    path_prepend_ = dir;
+}
+
+void Executor::set_env(const std::string &name, const std::string &value)
+{
+    for (auto &kv : extra_env_)
+    {
+        if (kv.first == name)
+        {
+            kv.second = value;
+            return;
+        }
+    }
+    extra_env_.push_back(std::make_pair(name, value));
+}
+
+namespace
+{
+
+// Builds the child's environment in the PARENT, before fork(): everything
+// between fork() and exec() in a multi-threaded process must avoid malloc,
+// and setenv() in the child would allocate. `storage` owns the strings that
+// the returned pointer array points into, so both must outlive the exec call.
+void build_child_env(const std::string &path_prepend, const std::vector<std::pair<std::string, std::string>> &extra,
+                     std::vector<std::string> &storage, std::vector<char *> &envp)
+{
+    const std::string kPathPrefix = "PATH=";
+    bool path_seen = false;
+    for (char **e = environ; e != nullptr && *e != nullptr; ++e)
+    {
+        std::string entry = *e;
+        if (!path_prepend.empty() && entry.compare(0, kPathPrefix.size(), kPathPrefix) == 0)
+        {
+            entry = kPathPrefix + path_prepend + ":" + entry.substr(kPathPrefix.size());
+            path_seen = true;
+        }
+        bool overridden = false;
+        for (const auto &kv : extra)
+            if (entry.compare(0, kv.first.size() + 1, kv.first + "=") == 0)
+                overridden = true; // the explicit value below wins
+        if (!overridden)
+            storage.push_back(entry);
+    }
+    if (!path_prepend.empty() && !path_seen)
+        storage.push_back(kPathPrefix + path_prepend); // no PATH inherited at all
+    for (const auto &kv : extra)
+        storage.push_back(kv.first + "=" + kv.second);
+    for (auto &entry : storage)
+        envp.push_back(const_cast<char *>(entry.c_str()));
+    envp.push_back(nullptr);
+}
+
+} // namespace
 
 ExecResult Executor::run(const std::string &command)
 {
@@ -79,6 +152,17 @@ ExecResult Executor::run(const std::string &command)
         result.output = "internal error: pipe() failed";
         return result;
     }
+
+    // Deliberately fork/exec rather than popen(): the child needs its own
+    // process group (for the group-wide SIGKILL below) and both streams
+    // merged into one pipe, neither of which popen() offers.
+    std::vector<std::string> env_storage;
+    std::vector<char *> envp;
+    build_child_env(path_prepend_, extra_env_, env_storage, envp);
+    std::string bash_path = "/bin/bash";
+    std::string dash_c = "-c";
+    char *argv[] = {const_cast<char *>(bash_path.c_str()), const_cast<char *>(dash_c.c_str()),
+                    const_cast<char *>(command.c_str()), nullptr};
 
     pid_t pid = fork();
     if (pid < 0)
@@ -103,8 +187,8 @@ ExecResult Executor::run(const std::string &command)
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
-        execl("/bin/bash", "bash", "-c", command.c_str(), static_cast<char *>(nullptr));
-        _exit(127); // execl failed
+        execve(bash_path.c_str(), argv, envp.data());
+        _exit(127); // execve failed
     }
 
     // Parent.
@@ -163,6 +247,10 @@ ExecResult Executor::run(const std::string &command)
         current_pgid_ = -1;
     }
 
+    // AUDIT NOTE: on a timeout or a control interrupt, exit_code keeps its
+    // initial -1 -- there is no real wait status to report, since the process
+    // group was SIGKILLed. Callers must read timed_out/killed_by_control
+    // rather than inferring failure from exit_code alone.
     if (timed_out)
         result.timed_out = true;
     else if (interrupted_)

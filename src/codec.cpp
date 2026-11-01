@@ -140,6 +140,9 @@ bool OpenAIChatCodec::decode_response(const std::string &body, Message &out, std
         json msg = choice.value("message", json::object());
 
         out.role = msg.value("role", std::string("assistant"));
+        out.finish_reason.clear();
+        if (choice.contains("finish_reason") && choice["finish_reason"].is_string())
+            out.finish_reason = choice["finish_reason"].get<std::string>();
         out.content.clear();
         if (msg.contains("content") && !msg["content"].is_null())
             out.content = msg["content"].is_string() ? msg["content"].get<std::string>() : msg["content"].dump();
@@ -153,9 +156,13 @@ bool OpenAIChatCodec::decode_response(const std::string &body, Message &out, std
 
     if (j.contains("content"))
     {
+        // Native /completion shape (SPEC.md §6.3): llama.cpp reports a
+        // max-token cutoff as "stopped_limit": true rather than an OpenAI
+        // finish_reason, so normalise it to the same vocabulary.
         out.role = "assistant";
         out.content = j["content"].is_string() ? j["content"].get<std::string>() : j["content"].dump();
         out.tool_calls.clear();
+        out.finish_reason = j.value("stopped_limit", false) ? "length" : "stop";
         return true;
     }
 
@@ -169,6 +176,10 @@ bool OpenAIChatCodec::decode_response(const std::string &body, Message &out, std
     return false;
 }
 
+// Folds ONE SSE chunk into `accumulator`, which the caller carries across the
+// whole stream -- the function is called once per chunk and never sees the
+// response as a whole. Every field is therefore additive or last-wins, and the
+// message is only complete when the stream ends (SPEC.md §9.3).
 bool OpenAIChatCodec::decode_stream_chunk(const std::string &chunk_json, Message &accumulator, std::string &err)
 {
     json j;
@@ -197,8 +208,26 @@ bool OpenAIChatCodec::decode_stream_chunk(const std::string &chunk_json, Message
                 for (const auto &d : delta["tool_calls"])
                 {
                     size_t idx = static_cast<size_t>(d.value("index", 0));
+                    // The index comes straight off the wire and sizes an
+                    // allocation, so it is bounded: at 96 bytes per ToolCall,
+                    // an index of 1e6 would claim ~92 MiB and 1e9 would exhaust
+                    // a 4 GB board. No real turn has 64 parallel calls.
+                    if (idx >= kMaxToolCallsPerTurn)
+                    {
+                        err = "tool_call index " + std::to_string(idx) + " exceeds the maximum of " +
+                              std::to_string(kMaxToolCallsPerTurn);
+                        return false;
+                    }
                     if (accumulator.tool_calls.size() <= idx)
                         accumulator.tool_calls.resize(idx + 1);
+                    // Each field is accumulated the way the wire delivers it,
+                    // which is why `name` and `arguments` are APPENDED rather
+                    // than assigned: a streamed tool call arrives as
+                    // fragments, with the name split across chunks and the
+                    // arguments JSON built up a few characters at a time. `id`
+                    // is assigned, because it arrives whole in the first chunk
+                    // of its call and is repeated verbatim if it arrives
+                    // again. Reading `+=` here as a bug is the easy mistake.
                     ToolCall &call = accumulator.tool_calls[idx];
                     if (d.contains("id") && d["id"].is_string())
                         call.id = d["id"].get<std::string>();
@@ -216,6 +245,8 @@ bool OpenAIChatCodec::decode_stream_chunk(const std::string &chunk_json, Message
                 }
             }
         }
+        if (choice.contains("finish_reason") && choice["finish_reason"].is_string())
+            accumulator.finish_reason = choice["finish_reason"].get<std::string>();
         if (accumulator.role.empty())
             accumulator.role = "assistant";
         return true;
@@ -226,6 +257,8 @@ bool OpenAIChatCodec::decode_stream_chunk(const std::string &chunk_json, Message
         if (accumulator.role.empty())
             accumulator.role = "assistant";
         accumulator.content += j["content"].is_string() ? j["content"].get<std::string>() : j["content"].dump();
+        if (j.value("stopped_limit", false))
+            accumulator.finish_reason = "length";
         return true;
     }
 

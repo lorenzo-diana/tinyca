@@ -10,7 +10,7 @@ D7).
 | `httplib.h` | [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) | `v0.14.3` | `2b857880236a38a64383e72e19d5af5a1b9a8f856884435ad2f4940cbcc4229a` |
 
 `httplib.h` is pinned to the 0.14.x line deliberately: releases from 0.15 onward
-require C++17, which this project does not use (PROMPT.md's non-negotiable
+require C++17, which this project does not use (the project's non-negotiable
 constraint #1). `0.14.3` is the last tag before that bump.
 
 Nothing else is vendored. No Boost, no yaml-cpp, no libcurl.

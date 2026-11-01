@@ -128,4 +128,37 @@ unsafe command execution. The 1.5B model is the limiting factor, consistent
 with SPEC.md §16, and the specific failure modes found here (skipping steps,
 read/write confusion, and — new — fabricating an unverified success) are
 useful, concrete evidence beyond the single first-run transcript already in
-`docs/first_run_transcript.jsonl`.
+`first_run_transcript.jsonl`.
+
+---
+
+## 2026-11-01 re-run — after the unlabelled-result fix
+
+The three tests above were re-run on the same board and model after two harness
+bugs were fixed (SPEC.md §6.1's result labelling and §9's truncated-reply
+guard), to separate "the model cannot do this" from "the model was never given
+what it needed". Same prompts, same sandbox config, `add_skill` temporarily
+hidden from Tier 1 so the skill set matched the original runs.
+
+| Task | Original result | Re-run result |
+|---|---|---|
+| "List the files and report how many there are" | 4 turns, same command 3×, repetition abort, 20.4 s | **one command, correct answer, 4.9 s** |
+| Test 1, step-by-step prompt (the one that succeeded) | success on the 4th prompt attempt | **success, 73 s** — `sort.c` written, compiled, run, `-2 0 1 3 4 5 8 9` reported. No regression |
+| Test 1, original one-shot prompt | skipped writing the file, repeated the failing `gcc`, aborted | **unchanged** — same skip, same repeat, aborted in 14 s |
+| Test 3, Fibonacci | buggy `fibonacci()`, and on one attempt a fabricated success it never ran | **same deterministic bug**, saw the real `TypeError`, re-emitted the identical script, aborted. Did **not** fabricate success this time (one run — a hint, not a result) |
+
+Conclusion: the labelling fix removes the failure class where the model already
+had the answer and did not recognise it as its own command's output. It does
+not touch planning ("write the file before compiling it") or error adaptation
+("the traceback says fix the return value"), which remain real limits of a
+1.5B model.
+
+**One regression found by re-running, not by inspection.** With `add_skill`
+advertised in the Tier 1 index, the model abandoned the sort task entirely: it
+tried `fetch_url.sh https://raw.githubusercontent.com/...` against a
+hallucinated URL, then registered a skill named `sort`, leaving a junk
+`skills/sort.sh` in the live skills directory — which would have appeared in
+every later session's system prompt. A 1.5B model reads "register a skill" as a
+shortcut for doing the work. Hence `skills.tier1_exclude`, defaulting to
+`add_skill`: discovered and runnable, deliberately not advertised (SPEC.md
+§7.1).

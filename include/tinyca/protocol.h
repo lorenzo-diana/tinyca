@@ -22,7 +22,6 @@ struct Action
     std::string id;
     std::string command;
     std::string tool_name;
-    std::string raw_args;
 };
 
 constexpr const char *kParseErrorToolName = "__parse_error__";

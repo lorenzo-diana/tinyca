@@ -1,6 +1,7 @@
 // BSD 3-Clause License — see LICENSE at the repository root.
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -8,6 +9,10 @@
 
 namespace tinyca
 {
+
+// Upper bound on parallel tool calls accepted from one streamed turn; the
+// wire-supplied index sizes an allocation, so it cannot be trusted unbounded.
+const size_t kMaxToolCallsPerTurn = 64;
 
 // Filled in by IProtocol::augment_request (SPEC.md §5) before encode_request.
 struct RequestOptions

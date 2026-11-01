@@ -36,6 +36,18 @@ std::vector<std::string> split(const std::string &s, char delim)
     return parts;
 }
 
+std::vector<std::string> split_trimmed(const std::string &s, char delim)
+{
+    std::vector<std::string> out;
+    for (const auto &raw : split(s, delim))
+    {
+        const std::string one = trim(raw);
+        if (!one.empty())
+            out.push_back(one);
+    }
+    return out;
+}
+
 std::string to_lower(const std::string &s)
 {
     std::string out = s;

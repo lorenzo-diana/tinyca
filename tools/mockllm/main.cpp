@@ -99,7 +99,8 @@ bool parse_args(int argc, char **argv, Options &opt, std::string &err)
 // Builds an OpenAI-style /v1/chat/completions response from one fixture
 // entry. A fixture entry may set "content" (plain text), or "tool_calls"
 // (an array), or both -- matching the real server's `content: null` +
-// `tool_calls` shape we found in docs/FINDINGS.md.
+// `tool_calls` shape we found in docs/FINDINGS.md -- and optionally
+// "finish_reason" to override the stop reason.
 json build_chat_response(const json &fixture_entry, int request_index)
 {
     json message;
@@ -111,7 +112,11 @@ json build_chat_response(const json &fixture_entry, int request_index)
     json choice;
     choice["index"] = 0;
     choice["message"] = message;
-    choice["finish_reason"] = fixture_entry.contains("tool_calls") ? "tool_calls" : "stop";
+    // A fixture can state finish_reason explicitly ("length" to simulate a
+    // reply cut at max_tokens); otherwise it follows the response shape.
+    choice["finish_reason"] = fixture_entry.contains("finish_reason")
+                                  ? fixture_entry["finish_reason"]
+                                  : nlohmann::json(fixture_entry.contains("tool_calls") ? "tool_calls" : "stop");
 
     json resp;
     resp["id"] = "mockllm-" + std::to_string(request_index);
@@ -143,19 +148,18 @@ class FixtureServer
     {
     }
 
+    // Serves fixture entries in order. Two properties the tests depend on:
+    //  - Past the end of the array the LAST entry is served repeatedly
+    //    (index is clamped, not wrapped), which is what lets a two-entry
+    //    fixture drive an unbounded agent loop and trip the repetition
+    //    detector.
+    //  - Responses are always one complete JSON body. There is no SSE
+    //    support here, so tests that drive the agent must set
+    //    llm.stream = false; the streaming path is covered separately by
+    //    test_transport_codec_integration against a throwaway SSE server.
     void handle(const httplib::Request &req, httplib::Response &res)
     {
         log_request(req);
-
-        json body;
-        try
-        {
-            body = json::parse(req.body);
-        }
-        catch (const std::exception &)
-        {
-            body = json::object();
-        }
 
         int index = request_count_;
         ++request_count_;

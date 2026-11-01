@@ -455,7 +455,7 @@ confirmed running (PWM=200, nonzero) and uptime continuous — no thermal risk, 
   (`"1\n\n[exit code: 0]"`), model then replied in plain text with no further
   action — exactly PROMPT.md's D7 acceptance: at least one real bash action, its
   real output received, termination on a no-action turn inside `max_iterations`.
-- `docs/first_run_transcript.jsonl`: the six JSONL lines from that exact successful
+- `first_run_transcript.jsonl`: the six JSONL lines from that exact successful
   run (user_task → request → response-with-action → tool_result → request →
   final response-with-no-action), extracted from the board's full transcript file
   (which also still has the earlier narration-only and empty-response attempts in
@@ -506,7 +506,7 @@ tool calls assumed raw-text) were never needed — `../llama.cpp_ubuntu_18`'s
 evidence for both questions, and both were built into `Config`/`HermesProtocol`
 directly rather than deferred.
 
-**On-device benchmark** (from the real D7 run, `docs/first_run_transcript.jsonl`):
+**On-device benchmark** (from the real D7 run, `first_run_transcript.jsonl`):
 2 turns for the task ("list files" → one real `ls -l | wc -l` action → final
 answer). Per-turn wall-clock: 3.14s (turn 1, action-producing) and 3.51s (turn
 2, final answer) — 6.66s total task wall-clock, both short replies. Underlying
@@ -552,7 +552,7 @@ Three real end-to-end tasks run against the real `llama-server` +
 Qwen2.5-Coder-1.5B on the Jetson, in a dedicated sandbox config
 (`command_filter_mode = none`, `allow_metacharacters = true` — SPEC.md §8.1's
 own sanctioned oneshot-sandbox exception, not a shipped-default change). Full
-writeup, transcripts, and generated artifacts in `docs/capability_tests/`.
+writeup, transcripts, and generated artifacts in `capability_tests/`.
 
 1. **Write/compile/run a sort algorithm** — genuine success on the 4th prompt
    attempt (model wrote `sort.c`, compiled, ran it, correct output,
@@ -589,3 +589,268 @@ only a repeated or malformed command. Flagging honestly as an open capability
 gap, not something this phase attempts to fix; the architecture's existing
 safety nets (repetition detector, command filter, graceful empty-response
 handling) held correctly across all 12 attempts total.
+
+## 2026-11-01 — post-D8 maintenance session (cleanup, audit, 15 defect fixes)
+
+Not a numbered phase. Entered with D0-D8 complete; left with the same
+architecture, a cleaned and re-commented codebase, 13 passing suites (was 12),
+and fifteen defects fixed — two of which had been mis-filed as model
+limitations.
+
+**Cleanup** (`clean-code`): `config.cpp` 487 -> ~400 lines by replacing 38
+`std::function` lambdas plus six `set_*_field` wrappers with typed
+member-pointer tables and one `parse_number<T>` trait; key set diffed
+old-vs-new (39 keys, identical). Removed dead `Agent::api_path_for`, a
+write-only `Action::raw_args`, an unused `httplib::Response`, a parsed-but-
+unused `json body` in mockllm, and two `bool` returns that could never be
+false. Two inherited comments were false and were corrected.
+
+**Commenting** (`comment-for-audit`): +104 lines, only where reading actually
+stumbled; seven `AUDIT NOTE:` hazards tagged. Refused to document one
+suspicion that measurement disproved (`Executor::interrupted_` is atomic, no
+race) and marked one premise explicitly unverified rather than asserting
+llama-server's stop-text behaviour.
+
+**Audit** (`quality-review`): 11 verified findings + 2 found later while
+fixing. All fixed this session except where noted:
+
+1. `finish_reason: "length"` was ignored, so a reply cut at `max_tokens` was
+   executed as if complete — a truncated `cat > f <<EOF` wrote a partial file
+   and reported success. Now detected in both wire shapes and both transports;
+   nothing executes, the model is told, the turn counts.
+2. Streamed `tool_call` index sized an allocation unchecked: `index: 2000000`
+   claimed ~183 MiB from one chunk. Bounded at 64.
+3. `grammars/hermes_tool_call.gbnf` did not exist, making `enable_grammar =
+   true` fatal in any clone. Written.
+4. `protocol.stop_sequences` was parsed, stored and never read while the
+   example config documented it as working. Applied; literal-only values
+   documented.
+5. SPEC §12's positional `[task]` was advertised by `--help` and silently
+   dropped, which also left a dead branch in `main.cpp`. Implemented.
+6. Tier 2 skills were implemented, unit-tested and unreachable (no production
+   caller, no mention in the prompt). Wired both ways — user-initiated in the
+   REPL, model-initiated via the trigger — behind `skills.tier2_enabled`
+   (default off).
+7. `transcript_max_bytes` bounded one run's growth, not the file (194 -> 388 ->
+   582 bytes over three runs at cap 200). Now seeded from the file's size, with
+   a new `transcript_max_bytes_per_run` for the old meaning and a clamp check
+   between them.
+8. `output_max_bytes` was not a hard cap (4137 bytes at 4096). Marker now
+   reserved inside the cap.
+9. Segmentation was not quote-aware: `echo "hello; world"` was rejected on the
+   token `world"`. Fixed last, deliberately, as the only change that *expands*
+   what runs; landed with an adversarial test set (`ls; rm -rf /`, `echo "a" ;
+   rm -rf /`, unbalanced quotes) that still fails closed.
+10. The one shipped skill could not run as advertised: commands execute with
+    `cwd = work_dir` while Tier 1 advertised a repo-root-relative path (exit
+    127), and the model's natural `../skills/...` correction was blocked by the
+    filter. `Executor` now puts the absolute skills dir on the child's PATH
+    (envp built pre-fork, `execve`) and skills are advertised by bare name.
+11. Build hygiene: neither the Makefile nor `run_tests.sh` tracked header
+    dependencies. A new `Config` field left stale objects behind and the link
+    produced a binary whose translation units disagreed on layout — no link
+    error, just `test_agent` taking the `--dry-run` branch with
+    `cli_dry_run == false`. Added `-MMD -MP` and a header-mtime check. This had
+    been silently poisoning every header edit in this project.
+12. Command output never reached the terminal (transcript only), and SPEC §15's
+    bold-yellow action colour had no call site. Added `set_on_action` /
+    `set_on_tool_output`.
+13. **Tool output was fed back unlabelled** — the session's most significant
+    finding, and not a model limitation. Qwen's template renders a `role:
+    "tool"` message as a user turn wrapped in `<tool_response>`, a shape the
+    model only ever saw after emitting a structured `<tool_call>`; after a
+    markdown fence an unlabelled result does not read as that fence's output
+    and the likeliest continuation is to re-emit the command. Measured at
+    `temperature = 0.2`: unlabelled looped 2/2 as `tool` and 2/2 as `user`;
+    labelled answered correctly 2/2. Results now carry `Output of <cmd>:`.
+    "List the files and report how many there are" went from a 4-turn
+    repetition abort (20.4 s) to one command and a correct answer (4.9 s).
+14. **Regression found by re-running, not by inspection**: with `add_skill`
+    advertised in Tier 1, the 1.5B model abandoned a compile-and-run task,
+    invented a GitHub URL to download a skill from, and registered a junk
+    `skills/sort.sh` into the live skills directory. New `skills.tier1_exclude`
+    (default `add_skill`) keeps a skill runnable but unadvertised.
+15. An empty generation (`content: ""`, `finish_reason: "stop"`) was reported as
+    a finished task with a blank answer — flagged at D7 and again post-D8,
+    never fixed. Now nudged once, then aborted honestly.
+
+**New features requested this session**: `add_skill` so the agent can create
+its own skills, with three operator-selectable safeguards
+(`skills.skill_checks`: screen a new skill's body, confirm before creation,
+screen every skill at startup) — a skill is auto-allowed as a whole, so its
+*contents* would otherwise bypass the whitelist entirely. Also
+`--resume-prompt ask|update|quit`: a resumed session whose stored system prompt
+differs from the regenerated one now reconciles explicitly instead of silently
+swapping the agent's instructions, and a resumed session continues writing to
+its own transcript.
+
+While building the startup screen I found and fixed a bug in my own validator:
+the first `VAR=value` line produced an empty head token and ended the scan, so
+nothing was ever rejected. Verified both directions afterwards — shipped skills
+pass under the default whitelist, `echo cleanup; rm -rf /tmp/x` buried on line
+2 of a skill is caught.
+
+**Capability re-run after fix 13** (`capability_tests/README.md`): the
+previously-successful sort task still succeeds (73 s, no regression); the
+one-shot sort prompt still fails the same way (skips writing the file, repeats
+the failing `gcc`); Fibonacci still produces the same deterministic bug but did
+not fabricate a success this time. So labelling removed the failure class where
+the model had the answer and did not recognise it, and left planning and
+error-adaptation untouched. SPEC §16 now separates measured model limits from
+harness bugs, with the evidence for each.
+
+**Gates**: `make`, `make test` (13 suites), `make check-portability`,
+`make check-format` all clean on x86-64 and natively on the Jetson under
+gcc 8.4.0. Hardware-verified on-device: labelled results, the action/output
+hooks, skills by bare name, `add_skill` creating a working skill and announcing
+it mid-session, and the Tier 1 index picking it up after restart.
+
+## 2026-11-01 (cont.) — confirm_commands, resume work-dir check, named sessions
+
+Follow-on work in the same session, after the 15 fixes above.
+
+- `tools.confirm_commands`: head tokens confirmed before every run even though
+  the filter allows them. Built-in default empty (no config file = unchanged
+  behaviour); `tinyca.ini.example` ships `python3,awk,sed`, because whitelisting
+  an interpreter grants everything that interpreter can do. Independent of
+  `confirm_mode` like `on_blocked_command`, so `--no-confirm` does not clear it
+  — documented, including that an unattended run then refuses those programs.
+- **Resume checks the work directory.** This needed the work dir to be recorded
+  at all, which it was not: every run now appends a `session_start` entry with
+  its absolute `work_dir`, and `--resume` compares. On a difference it prints
+  both paths and `--resume-work-dir ask|continue|quit` decides (ask on a TTY,
+  quit otherwise). Accepting records a `work_dir_update` entry naming the
+  previous directory.
+  Two ordering bugs found by the tests, not by inspection: `session_start` was
+  written at startup, which touched the transcript of a resume the user then
+  declined; and the system-prompt adoption was committed before the work-dir
+  question was asked. Reconciliation is now transactional — every difference is
+  decided first, then committed — so declining at any point leaves the file
+  byte-identical.
+- **Named sessions** (SPEC.md §12.3), new `src/session.cpp`: a session *is* its
+  transcript at `<sessions_dir>/<name>.jsonl`. No index file — the directory is
+  the registry, so uniqueness is one `stat()` that cannot drift, and sessions
+  can be archived with `mv`/`rm`. `--session <name>` creates or continues,
+  `--list-sessions` lists newest-first with task/entry/byte counts, `--resume`
+  accepts a bare name (falling back to treating the argument as a path, so
+  existing invocations keep working). Names are restricted to what is safe as a
+  filename, refused before anything is written.
+  Every session has a name, including unnamed ones:
+  `YYYY-MM-DD_hh-mm-ss_<work dir basename>` in local time, sanitised, with
+  `-2`, `-3`… for the same-second-same-directory case. The time uses dashes and
+  `:` is not a legal name character, so a session file can be copied onto a
+  FAT/exFAT/Windows volume as-is. An explicit `agent.transcript_log_path`
+  still opts out entirely.
+- **Rename**: `/rename <name>` in the REPL (moves the file with `rename(2)`,
+  points the logger at it via the new `Logger::set_path`, and records a
+  `session_rename` entry inside the file) and `--session <old> --rename-to
+  <new>` for scripts. Refused, with nothing changed, on an unusable name, a
+  taken name, the current name, or a missing source. `/sessions` marks the
+  current session, and TAB completes session names after `/rename `.
+
+New suite `test_session` (14 suites total). All gates clean on x86-64 and
+natively on the Jetson under gcc 8.4.0.
+
+## 2026-11-01 (cont.) — manual, second cleanup/comment/review pass
+
+- `docs/MANUAL.md` (452 lines): man-page-style reference for every CLI option,
+  every config key with type and default, sessions, skills and their
+  safeguards, protocols, command filtering, the REPL, the transcript entry
+  kinds, the environment passed to child commands, files, examples and exit
+  codes. Generated against the code (key tables extracted from `config.cpp`,
+  flags from `parse_cli`) rather than from memory, and cross-linked from
+  README and SPEC §3.
+- **Cleanup, KISS-focused**: `main()` 518 -> 260 lines by extracting four jobs
+  it was doing inline — `build_system_prompt`, `resolve_session_file`,
+  `resume_into`, `register_new_skills` — plus one session listing shared by
+  `--list-sessions` and `/sessions` instead of two printers. Removed three
+  further duplications: one `split_trimmed` helper for the five sites that
+  open-coded split+trim+drop-empty, `SkillRegistry::invocation_tokens` for the
+  three sites that derived a skill's two invocable spellings, and a hand-rolled
+  bubble sort replaced by `std::sort`. Dead-symbol sweep came back silent.
+- **Comments**: added the three notes a reviewer actually stumbles on — why
+  streamed `tool_call` fields are appended rather than assigned (the easy
+  mistake is reading `+=` as a bug), the `unique_session_name` 999-attempt
+  fallback, and the per-turn cost of the skills re-scan. Mean density 19%.
+- **Review**: six correctness findings, one of them a real security defect in
+  `blacklist` mode (quoting the program name bypasses it — verified with bash
+  actually deleting the files), plus a test-harness defect that produces false
+  failures. One suspicion measured and withdrawn. Details in the session
+  summary; nothing applied, per the review/fix separation.
+
+All gates clean on x86-64 and natively on the Jetson: 14 suites, zero
+warnings, `check-portability`, `check-format`.
+
+## 2026-11-01 (cont.) — all review findings fixed, docs made reachable
+
+- **Finding 1 (security, blacklist mode)**: `extract_head_token` now unquotes
+  the head token the way bash word-expands a command name, so `"rm"`, `'rm'`,
+  `\rm`, `r""m` and `$'rm'` all resolve to `rm`. The blacklist additionally
+  matches the **basename**, closing `/bin/rm` — found while fixing the quoting
+  case, same defect class (the filter was comparing spellings, not programs).
+  The whitelist deliberately does not match basenames, so `/opt/evil/ls` still
+  fails closed. Written test-first: 14 assertions failed before the fix, and
+  the original probe that watched bash delete files now reports BLOCK on every
+  spelling.
+- **Test-harness leak**: `launch_mockllm` became a scoped `MockServer` guard
+  that kills its child in the destructor and polls the port instead of sleeping
+  300 ms. Both halves mattered: the leak poisoned the *next* run (16 strays had
+  accumulated on the Jetson, 115 on the dev host), and the fixed sleep produced
+  "Could not establish connection" failures under load that looked like agent
+  defects. `run_tests.sh` also reaps strays defensively, for the case where a
+  test binary dies before its destructor runs. Verified: 0 strays after a full
+  run, from a clean slate.
+- **Finding 2**: `--resume <unknown>` is now fatal (exit 1) instead of starting
+  a fresh session logging into a file named after the typo, invisible to
+  `--list-sessions`.
+- **Finding 3**: `--session` together with `--resume` warns that it is ignored.
+- **Finding 4**: the session listing's task count tolerates JSON spacing
+  instead of substring-matching Logger's exact bytes, which silently reported
+  "0 task(s)" — a wrong number that reads like a real one.
+- **Finding 7**: `unique_session_name` now CLAIMS the name with
+  `O_CREAT|O_EXCL` rather than checking existence, closing the race where two
+  runs starting in the same second could interleave into one transcript. Noted
+  honestly: claiming creates the file, so a run that dies later in startup
+  leaves an empty session behind.
+- **Documentation reachability**: README has a Documentation section linking
+  every one of the eight `.md` files with a sentence on what each is for, and
+  `tests/integration_docs.sh` (new, 15th suite) fails if any `.md` in the repo
+  is unreachable from README.md or if a link points at a missing file. Both
+  failure modes verified by introducing them deliberately.
+- Also updated the `clean-code` skill with a final "Phase 9 — KISS, as the LAST
+  action" covering function scope, duplicate implementations, hand-rolled
+  standard algorithms and naming, with the explicit bar that simpler is not
+  shorter and that abstracting to satisfy the phase makes it worse.
+
+## 2026-11-01 (cont.) — documentation split into two disjoint trees
+
+Applied a new `clean-documentation` skill (written in the same session) to this
+repository. Four failure modes, in its order:
+
+- **Coverage** (derived from the code, not from the docs): all 46 config keys
+  and all 16 CLI long options were already documented in `docs/MANUAL.md`. One
+  real defect found: `--help` and SPEC §12 both advertised `implies --mode
+  oneshot`, and there is no `--mode` flag — help text that lied. Fixed in the
+  code and the spec.
+- **Duplication**: every config key was *defined* twice (SPEC §4 tables and
+  `docs/MANUAL.md` tables), the CLI option list twice, the capability ceiling
+  three times (README, SPEC §16, MANUAL), and the result-labelling rationale
+  three times. Each now has one home — MANUAL for what an option/key is and
+  does, SPEC for why it is that way, SPEC §16 for the limits — with one-line
+  references elsewhere. SPEC §4 and §12 became *decision* sections, which is
+  what a design document is for.
+- **Mixed material**: PROMPT.md (build brief + agent workflow), PROGRESS.md
+  (this journal) and the capability-test write-ups are development process, not
+  project documentation. They moved to `dev/` with their own index at
+  `dev/README.md`. SPEC §16 kept the measured limits and lost the narrative of
+  how they came to be measured; that story lives here.
+- **Reachability**: two disjoint trees, project rooted at `README.md` and
+  process at `dev/README.md`, with no link crossing in either direction.
+
+`tests/integration_docs.sh` was rewritten to enforce all four: orphans,
+dangling links, cross-tree links in either direction, and code-surface coverage
+of the manual. Breaking each rule on purpose exposed a bug in the checker
+itself — a single shared "seen" map meant the second tree walk skipped
+documents the first had already found, so a `dev/` document linking into the
+project tree passed. Independent walks per tree; all four violations now fail
+as they should.

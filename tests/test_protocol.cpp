@@ -237,6 +237,48 @@ void test_hermes_format_results_correlates_by_id()
     TINYCA_CHECK_EQ(msgs[0].tool_call_id, std::string("call_1"));
 }
 
+// The label is load-bearing, not cosmetic: an unlabelled result reads as
+// unrelated text to the model, which then re-emits the same command (measured
+// 2/2 on Qwen2.5-Coder-1.5B). Guards the three shapes.
+void test_fenced_results_are_labelled_with_their_command()
+{
+    tinyca::FencedProtocol protocol;
+
+    tinyca::ToolResult ran;
+    ran.command = "ls -l | wc -l";
+    ran.executed = true;
+    ran.ok = true;
+    ran.content = "1\n\n[exit code: 0]";
+
+    tinyca::ToolResult blocked;
+    blocked.command = "rm -rf /";
+    blocked.executed = false;
+    blocked.ok = false;
+    blocked.content = "blocked by command filter for security reasons: 'rm' is not in the whitelist";
+
+    tinyca::ToolResult no_command; // e.g. the truncated-reply note
+    no_command.content = "error: your reply was cut off";
+
+    std::vector<tinyca::ToolResult> results;
+    results.push_back(ran);
+    results.push_back(blocked);
+    results.push_back(no_command);
+
+    std::vector<tinyca::Message> messages = protocol.format_results(results);
+    TINYCA_CHECK_EQ(messages.size(), static_cast<size_t>(3));
+
+    TINYCA_CHECK_EQ(messages[0].role, std::string("tool"));
+    TINYCA_CHECK_EQ(messages[0].content, std::string("Output of `ls -l | wc -l`:\n1\n\n[exit code: 0]"));
+
+    // A command that never ran must not be reported as its output.
+    TINYCA_CHECK(messages[1].content.find("was not run") != std::string::npos);
+    TINYCA_CHECK(messages[1].content.find("Output of") == std::string::npos);
+    TINYCA_CHECK(messages[1].content.find("rm -rf /") != std::string::npos);
+
+    // Nothing to attribute it to, so it is passed through verbatim.
+    TINYCA_CHECK_EQ(messages[2].content, std::string("error: your reply was cut off"));
+}
+
 void run_all_tests()
 {
     TINYCA_RUN(test_fenced_well_formed_single_action);
@@ -255,6 +297,7 @@ void run_all_tests()
     TINYCA_RUN(test_hermes_augment_request_sets_tools_and_stop);
     TINYCA_RUN(test_hermes_with_grammar_switches_to_native_completion);
     TINYCA_RUN(test_hermes_format_results_correlates_by_id);
+    TINYCA_RUN(test_fenced_results_are_labelled_with_their_command);
 }
 
 } // namespace

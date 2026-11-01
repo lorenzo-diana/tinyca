@@ -181,7 +181,7 @@ ssh nano@<host> 'cd ~/TinyCA && ./build/tinyca -c config/tinyca.ini \
 
 D7 acceptance: the agent issues at least one bash action, receives its output, and
 terminates with a no-action turn inside `max_iterations`. Save the transcript to
-`docs/first_run_transcript.jsonl` and commit it — it is the evidence the loop works
+`first_run_transcript.jsonl` and commit it — it is the evidence the loop works
 against a real small model.
 
 Expect the first on-device run to expose format drift the mock cannot: unterminated

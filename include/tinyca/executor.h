@@ -4,6 +4,8 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace tinyca
 {
@@ -26,6 +28,18 @@ class Executor
 
     ExecResult run(const std::string &command);
 
+    // Directory prepended to the child's PATH, so a skill can be invoked by
+    // its bare filename from any work_dir (SPEC.md §7). Needed because
+    // commands run with cwd = work_dir while skills live outside it: the
+    // repo-root-relative form a skill's @usage advertises would otherwise
+    // fail with exit 127. Empty (the default) leaves PATH untouched.
+    void set_path_prepend(const std::string &dir);
+
+    // Adds (or replaces) one variable in the child's environment. Used to
+    // tell skills where the skills directory is -- they run with
+    // cwd = work_dir and cannot derive it (SPEC.md §7.1).
+    void set_env(const std::string &name, const std::string &value);
+
     // The control thread's way of cutting through a running command
     // immediately (SPEC.md §9.1), independent of the timeout. Safe to call
     // from a different thread than the one blocked in run(); a no-op if
@@ -38,6 +52,9 @@ class Executor
     int head_lines_;
     int tail_lines_;
     int max_bytes_;
+
+    std::string path_prepend_;
+    std::vector<std::pair<std::string, std::string>> extra_env_;
 
     std::mutex pgid_mutex_;
     pid_t current_pgid_ = -1;

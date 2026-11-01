@@ -1,0 +1,7 @@
+{
+  "scenario": "empty_twice",
+  "responses": [
+    {"content": ""},
+    {"content": "   "}
+  ]
+}

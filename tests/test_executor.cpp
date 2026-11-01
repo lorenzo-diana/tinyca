@@ -4,6 +4,8 @@
 #include <chrono>
 #include <thread>
 
+#include <unistd.h>
+
 #include "test_util.h"
 
 namespace
@@ -119,16 +121,53 @@ void test_truncate_output_hard_caps_bytes()
     std::string out = truncate_output(in, 40, 40, 100);
     TINYCA_CHECK(out.size() < in.size());
     TINYCA_CHECK(out.find("truncated at output_max_bytes") != std::string::npos);
+    // SPEC.md §8 calls this a hard cap, so the marker must fit inside it --
+    // guards a defect where appending the marker after resize(max_bytes)
+    // returned 4137 bytes for max_bytes = 4096.
+    TINYCA_CHECK(out.size() <= 100);
+
+    std::string capped_4096 = truncate_output(in, 40, 40, 4096);
+    TINYCA_CHECK(capped_4096.size() <= 4096);
+
+    // Degenerate case: a cap shorter than the marker still reports that
+    // something was cut, and still respects the cap.
+    std::string tiny = truncate_output(in, 40, 40, 8);
+    TINYCA_CHECK(tiny.size() <= 8);
+    TINYCA_CHECK(!tiny.empty());
 }
 
 void test_five_megabyte_output_is_truncated_not_hung()
 {
-    // Required fixture scenario (PROMPT.md): a single pip-install-sized log
+    // Required fixture scenario (dev/PROMPT.md): a single pip-install-sized log
     // must not destroy the context window or the Executor itself.
     Executor ex("/tmp", 10, 40, 40, 4096);
     auto r = ex.run("head -c 5000000 /dev/zero | tr '\\0' 'a'");
     TINYCA_CHECK(!r.timed_out);
     TINYCA_CHECK(r.output.size() < static_cast<size_t>(10000)); // well under 5MB after truncation
+}
+
+// 13(a): a skill must be runnable by bare filename from inside work_dir,
+// which is a different directory than the one skills live in. Guards the
+// defect where the advertised usage "skills/fetch_url.sh ..." returned exit
+// 127 ("No such file or directory") for every skill invocation.
+void test_path_prepend_makes_a_skill_runnable_by_bare_name()
+{
+    char cwd[4096];
+    TINYCA_CHECK(getcwd(cwd, sizeof(cwd)) != nullptr);
+    const std::string skills_abs = std::string(cwd) + "/skills";
+
+    // work_dir deliberately is NOT the repo root, mirroring the real default.
+    tinyca::Executor without_path("/tmp", 10, 40, 40, 4096);
+    tinyca::ExecResult missing = without_path.run("fetch_url.sh");
+    TINYCA_CHECK_EQ(missing.exit_code, 127);
+
+    tinyca::Executor with_path("/tmp", 10, 40, 40, 4096);
+    with_path.set_path_prepend(skills_abs);
+    tinyca::ExecResult found = with_path.run("fetch_url.sh");
+    // Found and executed: the script rejects a wrong argument count with 2,
+    // which is proof it ran rather than failing to resolve.
+    TINYCA_CHECK_EQ(found.exit_code, 2);
+    TINYCA_CHECK(found.output.find("usage:") != std::string::npos);
 }
 
 void run_all_tests()
@@ -142,6 +181,7 @@ void run_all_tests()
     TINYCA_RUN(test_truncate_output_omits_middle_lines);
     TINYCA_RUN(test_truncate_output_hard_caps_bytes);
     TINYCA_RUN(test_five_megabyte_output_is_truncated_not_hung);
+    TINYCA_RUN(test_path_prepend_makes_a_skill_runnable_by_bare_name);
 }
 
 } // namespace

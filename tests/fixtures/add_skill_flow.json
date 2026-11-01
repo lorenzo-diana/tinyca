@@ -1,0 +1,7 @@
+{
+  "scenario": "add_skill_flow",
+  "responses": [
+    {"content": "```bash\nadd_skill.sh count_files \"Count the files here.\" \"count_files.sh\" ls -1\n```\n"},
+    {"content": "The skill is registered."}
+  ]
+}

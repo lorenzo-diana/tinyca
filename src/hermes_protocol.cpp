@@ -79,7 +79,6 @@ bool HermesProtocol::parse(const Message &assistant, std::vector<Action> &out, s
                 a.id = id;
                 a.tool_name = "bash";
                 a.command = command;
-                a.raw_args = tc.arguments;
                 out.push_back(a);
             }
             catch (const std::exception &)
@@ -90,7 +89,19 @@ bool HermesProtocol::parse(const Message &assistant, std::vector<Action> &out, s
         return true;
     }
 
-    // Defensive path: raw <tool_call>...</tool_call> text in content.
+    // Defensive path: raw <tool_call>...</tool_call> text in content, for a
+    // server that renders tool calls into the content string instead of the
+    // structured array (dev/PROMPT.md W0.3's fallback assumption).
+    //
+    // AUDIT NOTE: this path needs the closing </tool_call> tag, but that tag
+    // is also this protocol's only stop sequence. If the server omits the
+    // matched stop text from the returned content -- not verified against
+    // this build of llama-server -- every raw-text turn parses as
+    // "unterminated <tool_call> block" and is fed back to the model as a
+    // tool error rather than executed. SPEC.md §6.2 calls for re-appending
+    // the terminator before parsing; that is not implemented here. The
+    // structured-tool_calls path above is unaffected, and is what the
+    // D7/capability runs actually exercised.
     const std::string &content = assistant.content;
     const std::string open_tag = "<tool_call>";
     const std::string close_tag = "</tool_call>";
@@ -129,7 +140,6 @@ bool HermesProtocol::parse(const Message &assistant, std::vector<Action> &out, s
                 a.id = id;
                 a.tool_name = "bash";
                 a.command = command;
-                a.raw_args = arguments.dump();
                 out.push_back(a);
             }
         }

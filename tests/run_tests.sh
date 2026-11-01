@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds and runs every tests/test_*.cpp against the project's sources (minus
 # main.cpp, which defines its own main()). No test framework dependency --
-# see tests/test_util.h. Must pass offline, no network, no LLM (PROMPT.md).
+# see tests/test_util.h. Must pass offline, no network, no LLM (dev/PROMPT.md).
 #
 # Library sources are compiled to .o once and relinked per test binary,
 # rather than recompiled from scratch for every test file -- this is the
@@ -10,6 +10,13 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+
+# A crashed test binary can leave its mock server holding a port, and the next
+# run would then fail to connect -- a failure that looks like a code defect.
+# test_agent's MockServer guard normally prevents this; reaping here covers the
+# case where the process died before its destructor ran. The bracket in the
+# pattern keeps pkill from matching its own command line.
+pkill -9 -f '[b]uild/mockllm' 2>/dev/null || true
 
 OBJ_DIR="build/tests/obj"
 BUILD_DIR="build/tests"
@@ -20,11 +27,18 @@ CXXFLAGS="-std=c++11 -O0 -g -Wall -Wextra -Iinclude -Ithird_party -Itests -pthre
 
 overall=0
 
+# Headers are prerequisites too: rebuilding only when the .cpp is newer left
+# stale objects after a header edit, and relinking them produced test binaries
+# whose translation units disagreed on a struct's layout (silent wrong
+# results, not a link error). Cheap approximation of real dependency tracking:
+# if any project or vendored header is newer than an object, rebuild it.
+NEWEST_HDR="$(ls -t include/tinyca/*.h third_party/*.h third_party/*.hpp tests/test_util.h 2>/dev/null | head -1)"
+
 LIB_OBJS=()
 for src in src/*.cpp; do
     [ "$(basename "$src")" = "main.cpp" ] && continue
     obj="$OBJ_DIR/$(basename "${src%.cpp}").o"
-    if [ ! -e "$obj" ] || [ "$src" -nt "$obj" ]; then
+    if [ ! -e "$obj" ] || [ "$src" -nt "$obj" ] || [ -n "$NEWEST_HDR" -a "$NEWEST_HDR" -nt "$obj" ]; then
         if ! $CXX $CXXFLAGS -c "$src" -o "$obj" 2>"$BUILD_DIR/$(basename "$src").build.log"; then
             echo "BUILD FAIL: $src"
             cat "$BUILD_DIR/$(basename "$src").build.log"

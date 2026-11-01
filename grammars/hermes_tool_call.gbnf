@@ -1,0 +1,19 @@
+# GBNF constraining the model to exactly one Hermes tool call and nothing else
+# (SPEC.md §6.2/§6.3). Only `bash` exists, and its single argument is
+# `command`, so both are literals here: the grammar makes a malformed or
+# misnamed call impossible by construction. It does NOT make the command
+# itself sensible -- that is what CommandFilter is for.
+#
+# Only honoured on llama.cpp's native /completion endpoint, which is why
+# load_config rewrites llm.api_path when protocol.enable_grammar = true. A
+# preceding <think> block cannot be expressed here, which is why that
+# combination is rejected at startup rather than silently truncated.
+root        ::= "<tool_call>\n" call "\n</tool_call>"
+call        ::= "{\"name\": \"bash\", \"arguments\": {\"command\": " string "}}"
+
+string      ::= "\"" char* "\""
+char        ::= unescaped | "\\" escape
+escape      ::= ["\\/bfnrt] | "u" hex hex hex hex
+hex         ::= [0-9a-fA-F]
+# Everything except '"', '\' and the C0 control range, which must be escaped.
+unescaped   ::= [^"\\\x00-\x1F]

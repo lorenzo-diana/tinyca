@@ -1,0 +1,6 @@
+#!/bin/bash
+# Template copied by add_skill.sh to create a new skill. It carries the
+# executable bit so the copy is runnable without chmod -- chmod is on the
+# default blacklist and absent from the default whitelist, so add_skill.sh
+# must never need it (SPEC.md §7.1).
+set -euo pipefail

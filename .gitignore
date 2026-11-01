@@ -1,7 +1,5 @@
 build/
 logs/
 workspace/
-config/tinyca.ini
 jetson.conf
-never_commit/
 *.gguf

@@ -1,0 +1,7 @@
+{
+  "scenario": "two_think_blocks",
+  "responses": [
+    {"content": "<think>first thought</think>\nok,\n<think>second thought</think>\n```bash\necho hi\n```\n"},
+    {"content": "Done."}
+  ]
+}

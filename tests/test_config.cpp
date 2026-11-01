@@ -33,6 +33,17 @@ bool has_warning_containing(const std::vector<std::string>& warnings, const std:
     return false;
 }
 
+// Tests that set up a Config by hand and then exercise load_config's
+// validation chain must be isolated from the repository's own
+// ./config/tinyca.ini -- that file is real and committed, and letting it load
+// would overwrite exactly the fields the test just set. Pointing -c at a path
+// that does not exist keeps the file-loading step a no-op while leaving the
+// CLI handling and the validation chain under test.
+std::vector<std::string> argv_without_config_file()
+{
+    return {"tinyca", "-c", "tests/fixtures/ini/does_not_exist.ini"};
+}
+
 void test_missing_file_uses_defaults()
 {
     std::vector<std::string> argv_storage = {"tinyca", "-c", "tests/fixtures/ini/does_not_exist.ini"};
@@ -141,7 +152,7 @@ void test_cli_flags_no_confirm_dry_run_verbose_prompt()
 
 void test_grammar_fenced_is_ignored_with_warning()
 {
-    std::vector<std::string> argv_storage = {"tinyca"};
+    std::vector<std::string> argv_storage = argv_without_config_file();
     auto argv = make_argv(argv_storage);
     tinyca::Config cfg;
     cfg.protocol_enable_grammar = true;
@@ -155,7 +166,7 @@ void test_grammar_fenced_is_ignored_with_warning()
 
 void test_grammar_with_strip_think_false_is_fatal()
 {
-    std::vector<std::string> argv_storage = {"tinyca"};
+    std::vector<std::string> argv_storage = argv_without_config_file();
     auto argv = make_argv(argv_storage);
     tinyca::Config cfg;
     cfg.protocol_enable_grammar = true;
@@ -169,7 +180,7 @@ void test_grammar_with_strip_think_false_is_fatal()
 
 void test_grammar_hermes_overrides_api_path()
 {
-    std::vector<std::string> argv_storage = {"tinyca"};
+    std::vector<std::string> argv_storage = argv_without_config_file();
     auto argv = make_argv(argv_storage);
     tinyca::Config cfg;
     cfg.protocol_enable_grammar = true;
@@ -180,6 +191,132 @@ void test_grammar_hermes_overrides_api_path()
     TINYCA_CHECK(result.ok);
     TINYCA_CHECK_EQ(cfg.llm_api_path, std::string("/completion"));
     TINYCA_CHECK(has_warning_containing(result.warnings, "overriding llm.api_path"));
+}
+
+// Guards the typed key tables in config.cpp: a known key with an unusable
+// value must warn and keep its default rather than abort the load or write a
+// garbage value. One case per value type (int, double, bool, enum, long) --
+// the per-type error wording is what a user sees in the warning.
+void test_invalid_values_warn_and_keep_defaults()
+{
+    std::vector<std::string> argv_storage = {"tinyca", "-c", "tests/fixtures/ini/invalid_values.ini"};
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok); // never fatal
+    // Trailing garbage is rejected outright, not silently parsed as 512.
+    TINYCA_CHECK_EQ(cfg.llm_max_tokens, 512);
+    TINYCA_CHECK_EQ(cfg.llm_temperature, 0.2);
+    TINYCA_CHECK(cfg.llm_stream);
+    TINYCA_CHECK_EQ(cfg.protocol_tool_protocol, std::string("fenced"));
+    TINYCA_CHECK_EQ(cfg.agent_transcript_max_bytes, 0L);
+
+    TINYCA_CHECK(has_warning_containing(result.warnings, "invalid integer '512abc'"));
+    TINYCA_CHECK(has_warning_containing(result.warnings, "invalid number 'not-a-number'"));
+    TINYCA_CHECK(has_warning_containing(result.warnings, "invalid boolean 'maybe'"));
+    TINYCA_CHECK(has_warning_containing(result.warnings, "invalid value 'telepathy'"));
+    TINYCA_CHECK(has_warning_containing(result.warnings, "invalid integer '10x'"));
+    TINYCA_CHECK(has_warning_containing(result.warnings, "keeping default"));
+}
+
+// The shipped config is what users actually run, and it names every key, so a
+// key named there but absent from (or misspelled in) config.cpp's tables would
+// silently do nothing. Asserted here so the next key added cannot regress it.
+void test_shipped_config_has_no_unknown_or_invalid_keys()
+{
+    std::vector<std::string> argv_storage = {"tinyca", "-c", "config/tinyca.ini"};
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK(!has_warning_containing(result.warnings, "config file not found"));
+    TINYCA_CHECK(!has_warning_containing(result.warnings, "unknown config key"));
+    TINYCA_CHECK(!has_warning_containing(result.warnings, "keeping default"));
+    TINYCA_CHECK(!has_warning_containing(result.warnings, "malformed"));
+}
+
+// The per-run cap must sit inside the total-file cap, and a cap too small to
+// hold one entry plus the cutoff marker must be called out at startup rather
+// than silently producing an empty transcript (SPEC.md §9.2).
+void test_transcript_cap_relationship_and_minimum()
+{
+    std::vector<std::string> argv_storage = argv_without_config_file();
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    cfg.agent_transcript_max_bytes = 1000;
+    cfg.agent_transcript_max_bytes_per_run = 5000; // larger than the total: incoherent
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK_EQ(cfg.agent_transcript_max_bytes_per_run, 1000L); // clamped to the total
+    TINYCA_CHECK(has_warning_containing(result.warnings, "clamping it to the total cap"));
+
+    std::vector<std::string> argv_storage2 = argv_without_config_file();
+    auto argv2 = make_argv(argv_storage2);
+    tinyca::Config tiny;
+    tiny.agent_transcript_max_bytes = 80;
+    tiny.agent_transcript_max_bytes_per_run = 50;
+    auto result2 = tinyca::load_config(static_cast<int>(argv2.size()), argv2.data(), tiny);
+
+    TINYCA_CHECK(result2.ok); // never fatal
+    TINYCA_CHECK(has_warning_containing(result2.warnings, "agent.transcript_max_bytes=80 is below"));
+    TINYCA_CHECK(has_warning_containing(result2.warnings, "agent.transcript_max_bytes_per_run=50 is below"));
+}
+
+// 10c: a key defined twice keeps last-wins (every INI reader does) but must
+// not do so silently -- one of the two values is dead config the author
+// believes is live.
+void test_duplicate_key_warns_and_last_wins()
+{
+    std::vector<std::string> argv_storage = {"tinyca", "-c", "tests/fixtures/ini/duplicate_key.ini"};
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK(has_warning_containing(result.warnings, "duplicate key 'llm.base_url'"));
+    TINYCA_CHECK_EQ(cfg.llm_base_url, std::string("http://second.example"));
+}
+
+// G1: SPEC.md §12's positional [task]. --help advertises it, so it must
+// actually arrive -- it used to be dropped silently, which also left the
+// REPL's "run one task then stay interactive" branch unreachable.
+void test_positional_task_is_picked_up()
+{
+    std::vector<std::string> argv_storage = {"tinyca", "list", "the", "files"};
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK_EQ(cfg.cli_task_prompt, std::string("list the files"));
+    // Unlike -p, a positional task does NOT force oneshot (§12).
+    TINYCA_CHECK_EQ(cfg.agent_mode, std::string("interactive"));
+
+    // -p wins over a positional argument and still implies oneshot.
+    std::vector<std::string> argv_storage2 = {"tinyca", "-p", "from flag", "from", "positional"};
+    auto argv2 = make_argv(argv_storage2);
+    tinyca::Config cfg2;
+    tinyca::load_config(static_cast<int>(argv2.size()), argv2.data(), cfg2);
+    TINYCA_CHECK_EQ(cfg2.cli_task_prompt, std::string("from flag"));
+    TINYCA_CHECK_EQ(cfg2.agent_mode, std::string("oneshot"));
+}
+
+// The shipped config is what runs by default, so the interpreters it lists for
+// confirmation must actually reach Config (guards a typo in the key name).
+void test_shipped_config_sets_confirm_commands()
+{
+    std::vector<std::string> argv_storage = {"tinyca", "-c", "config/tinyca.ini"};
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(cfg.tools_confirm_commands.find("python3") != std::string::npos);
+    // The built-in default stays empty, so no config file means no prompts.
+    tinyca::Config untouched;
+    TINYCA_CHECK(untouched.tools_confirm_commands.empty());
 }
 
 void run_all_tests()
@@ -194,6 +331,12 @@ void run_all_tests()
     TINYCA_RUN(test_grammar_fenced_is_ignored_with_warning);
     TINYCA_RUN(test_grammar_with_strip_think_false_is_fatal);
     TINYCA_RUN(test_grammar_hermes_overrides_api_path);
+    TINYCA_RUN(test_invalid_values_warn_and_keep_defaults);
+    TINYCA_RUN(test_shipped_config_has_no_unknown_or_invalid_keys);
+    TINYCA_RUN(test_transcript_cap_relationship_and_minimum);
+    TINYCA_RUN(test_duplicate_key_warns_and_last_wins);
+    TINYCA_RUN(test_positional_task_is_picked_up);
+    TINYCA_RUN(test_shipped_config_sets_confirm_commands);
 }
 
 } // namespace

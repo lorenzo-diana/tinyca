@@ -3,7 +3,6 @@
 
 #include <getopt.h>
 
-#include <functional>
 #include <map>
 #include <stdexcept>
 
@@ -32,47 +31,42 @@ bool parse_bool(const std::string &raw, bool &out)
     return false;
 }
 
-bool parse_int(const std::string &raw, int &out)
+// std::stoi/stol/stod differ only in name, so the "whole string consumed,
+// otherwise reject" logic is shared through one trait rather than written
+// out three times.
+template <typename T> struct NumParse;
+template <> struct NumParse<int>
 {
-    try
+    static int call(const std::string &s, size_t *pos)
     {
-        size_t pos = 0;
-        int v = std::stoi(trim(raw), &pos);
-        if (pos != trim(raw).size())
-            return false;
-        out = v;
-        return true;
+        return std::stoi(s, pos);
     }
-    catch (const std::exception &)
+};
+template <> struct NumParse<long>
+{
+    static long call(const std::string &s, size_t *pos)
     {
-        return false;
+        return std::stol(s, pos);
     }
-}
+};
+template <> struct NumParse<double>
+{
+    static double call(const std::string &s, size_t *pos)
+    {
+        return std::stod(s, pos);
+    }
+};
 
-bool parse_long(const std::string &raw, long &out)
+// A trailing-garbage value ("512abc") is rejected rather than silently
+// accepted as 512 -- a typo in the INI file should surface as a warning.
+template <typename T> bool parse_number(const std::string &raw, T &out)
 {
+    const std::string s = trim(raw);
     try
     {
         size_t pos = 0;
-        long v = std::stol(trim(raw), &pos);
-        if (pos != trim(raw).size())
-            return false;
-        out = v;
-        return true;
-    }
-    catch (const std::exception &)
-    {
-        return false;
-    }
-}
-
-bool parse_double(const std::string &raw, double &out)
-{
-    try
-    {
-        size_t pos = 0;
-        double v = std::stod(trim(raw), &pos);
-        if (pos != trim(raw).size())
+        T v = NumParse<T>::call(s, &pos);
+        if (pos != s.size())
             return false;
         out = v;
         return true;
@@ -91,201 +85,159 @@ bool is_one_of(const std::string &v, const std::vector<std::string> &choices)
     return false;
 }
 
-using Setter = std::function<bool(Config &, const std::string &, std::string &)>;
-
-bool set_string_field(std::string &field, const std::string &value, std::string &)
+// SPEC.md §4's key list, as data: one row per `section.key`, grouped by the
+// field type it writes. These tables are the only place a config key name
+// appears -- adding a key means adding one row, not touching any parsing
+// logic. Keys are addressed as "section.key" exactly as IniParser emits them.
+template <typename T> struct KeyRow
 {
-    field = value;
-    return true;
+    const char *key;
+    T Config::*field;
+};
+
+struct EnumRow
+{
+    const char *key;
+    std::string Config::*field;
+    const char *choices; // comma-separated, validated against the raw value
+};
+
+const KeyRow<std::string> kStringKeys[] = {
+    {"llm.base_url", &Config::llm_base_url},
+    {"llm.api_path", &Config::llm_api_path},
+    {"llm.model_id", &Config::llm_model_id},
+    {"llm.api_key", &Config::llm_api_key},
+    {"protocol.grammar_file", &Config::protocol_grammar_file},
+    {"protocol.stop_sequences", &Config::protocol_stop_sequences},
+    {"agent.system_prompt_file", &Config::agent_system_prompt_file},
+    {"agent.work_dir", &Config::agent_work_dir},
+    {"agent.transcript_log_path", &Config::agent_transcript_log_path},
+    {"agent.sessions_dir", &Config::agent_sessions_dir},
+    {"tools.whitelist", &Config::tools_whitelist},
+    {"tools.blacklist", &Config::tools_blacklist},
+    {"tools.confirm_commands", &Config::tools_confirm_commands},
+    {"skills.skills_dir", &Config::skills_skills_dir},
+    {"skills.skill_checks", &Config::skills_skill_checks},
+    {"skills.add_skill_name", &Config::skills_add_skill_name},
+    {"skills.tier1_exclude", &Config::skills_tier1_exclude},
+};
+
+const EnumRow kEnumKeys[] = {
+    {"protocol.tool_protocol", &Config::protocol_tool_protocol, "fenced,hermes"},
+    {"agent.log_level", &Config::agent_log_level, "error,warn,info,debug"},
+    {"agent.mode", &Config::agent_mode, "interactive,oneshot"},
+    {"agent.color_output", &Config::agent_color_output, "auto,always,never"},
+    {"tools.command_filter_mode", &Config::tools_command_filter_mode, "whitelist,blacklist,none"},
+    {"tools.on_blocked_command", &Config::tools_on_blocked_command, "ask,deny"},
+    {"tools.confirm_mode", &Config::tools_confirm_mode, "always,never"},
+};
+
+const KeyRow<bool> kBoolKeys[] = {
+    {"llm.stream", &Config::llm_stream},
+    {"protocol.enable_grammar", &Config::protocol_enable_grammar},
+    {"protocol.strip_think", &Config::protocol_strip_think},
+    {"protocol.strip_think_from_history", &Config::protocol_strip_think_from_history},
+    {"tools.allow_metacharacters", &Config::tools_allow_metacharacters},
+    {"skills.tier1_enabled", &Config::skills_tier1_enabled},
+    {"skills.tier2_enabled", &Config::skills_tier2_enabled},
+};
+
+const KeyRow<int> kIntKeys[] = {
+    {"llm.request_timeout_s", &Config::llm_request_timeout_s},
+    {"llm.connect_timeout_s", &Config::llm_connect_timeout_s},
+    {"llm.max_tokens", &Config::llm_max_tokens},
+    {"llm.context_tokens", &Config::llm_context_tokens},
+    {"agent.max_iterations", &Config::agent_max_iterations},
+    {"agent.repetition_threshold", &Config::agent_repetition_threshold},
+    {"tools.bash_timeout_s", &Config::tools_bash_timeout_s},
+    {"tools.output_head_lines", &Config::tools_output_head_lines},
+    {"tools.output_tail_lines", &Config::tools_output_tail_lines},
+    {"tools.output_max_bytes", &Config::tools_output_max_bytes},
+    {"skills.max_tier1_skills", &Config::skills_max_tier1_skills},
+};
+
+const KeyRow<long> kLongKeys[] = {
+    {"agent.transcript_max_bytes", &Config::agent_transcript_max_bytes},
+    {"agent.transcript_max_bytes_per_run", &Config::agent_transcript_max_bytes_per_run},
+};
+
+const KeyRow<double> kDoubleKeys[] = {
+    {"llm.temperature", &Config::llm_temperature},
+    {"llm.top_p", &Config::llm_top_p},
+};
+
+template <typename T, size_t N> const KeyRow<T> *find_row(const KeyRow<T> (&rows)[N], const std::string &key)
+{
+    for (size_t i = 0; i < N; ++i)
+        if (key == rows[i].key)
+            return &rows[i];
+    return nullptr;
 }
 
-bool set_enum_field(std::string &field, const std::string &value, const std::vector<std::string> &choices,
-                    std::string &err)
+// Applies one `section.key = value` pair. Returns false on a *known* key with
+// an unusable value (`err` set, caller keeps the default); sets `known` to
+// false for a key in no table, which the caller reports separately as an
+// unknown-key warning. A missing or bad key is never fatal (dev/PROMPT.md "Style").
+bool apply_key(Config &out, const std::string &key, const std::string &value, std::string &err, bool &known)
 {
-    if (!is_one_of(value, choices))
+    known = true;
+
+    if (const KeyRow<std::string> *row = find_row(kStringKeys, key))
     {
-        err = "invalid value '" + value + "'";
-        return false;
+        out.*(row->field) = value;
+        return true;
     }
-    field = value;
-    return true;
-}
-
-bool set_bool_field(bool &field, const std::string &value, std::string &err)
-{
-    bool v;
-    if (!parse_bool(value, v))
+    for (const auto &row : kEnumKeys)
     {
-        err = "invalid boolean '" + value + "'";
-        return false;
+        if (key != row.key)
+            continue;
+        if (!is_one_of(value, split(row.choices, ',')))
+        {
+            err = "invalid value '" + value + "'";
+            return false;
+        }
+        out.*(row.field) = value;
+        return true;
     }
-    field = v;
-    return true;
-}
-
-bool set_int_field(int &field, const std::string &value, std::string &err)
-{
-    int v;
-    if (!parse_int(value, v))
+    if (const KeyRow<bool> *row = find_row(kBoolKeys, key))
     {
-        err = "invalid integer '" + value + "'";
-        return false;
+        if (!parse_bool(value, out.*(row->field)))
+        {
+            err = "invalid boolean '" + value + "'";
+            return false;
+        }
+        return true;
     }
-    field = v;
-    return true;
-}
-
-bool set_long_field(long &field, const std::string &value, std::string &err)
-{
-    long v;
-    if (!parse_long(value, v))
+    if (const KeyRow<int> *row = find_row(kIntKeys, key))
     {
-        err = "invalid integer '" + value + "'";
-        return false;
+        if (!parse_number(value, out.*(row->field)))
+        {
+            err = "invalid integer '" + value + "'";
+            return false;
+        }
+        return true;
     }
-    field = v;
-    return true;
-}
-
-bool set_double_field(double &field, const std::string &value, std::string &err)
-{
-    double v;
-    if (!parse_double(value, v))
+    if (const KeyRow<long> *row = find_row(kLongKeys, key))
     {
-        err = "invalid number '" + value + "'";
-        return false;
+        if (!parse_number(value, out.*(row->field)))
+        {
+            err = "invalid integer '" + value + "'";
+            return false;
+        }
+        return true;
     }
-    field = v;
-    return true;
-}
+    if (const KeyRow<double> *row = find_row(kDoubleKeys, key))
+    {
+        if (!parse_number(value, out.*(row->field)))
+        {
+            err = "invalid number '" + value + "'";
+            return false;
+        }
+        return true;
+    }
 
-std::map<std::string, Setter> build_key_table()
-{
-    std::map<std::string, Setter> t;
-
-    t["llm.base_url"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.llm_base_url, v, e);
-    };
-    t["llm.api_path"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.llm_api_path, v, e);
-    };
-    t["llm.model_id"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.llm_model_id, v, e);
-    };
-    t["llm.api_key"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.llm_api_key, v, e);
-    };
-    t["llm.request_timeout_s"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.llm_request_timeout_s, v, e);
-    };
-    t["llm.connect_timeout_s"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.llm_connect_timeout_s, v, e);
-    };
-    t["llm.max_tokens"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.llm_max_tokens, v, e);
-    };
-    t["llm.temperature"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_double_field(c.llm_temperature, v, e);
-    };
-    t["llm.top_p"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_double_field(c.llm_top_p, v, e);
-    };
-    t["llm.context_tokens"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.llm_context_tokens, v, e);
-    };
-    t["llm.stream"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_bool_field(c.llm_stream, v, e);
-    };
-
-    t["protocol.tool_protocol"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_enum_field(c.protocol_tool_protocol, v, {"fenced", "hermes"}, e);
-    };
-    t["protocol.enable_grammar"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_bool_field(c.protocol_enable_grammar, v, e);
-    };
-    t["protocol.grammar_file"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.protocol_grammar_file, v, e);
-    };
-    t["protocol.strip_think"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_bool_field(c.protocol_strip_think, v, e);
-    };
-    t["protocol.strip_think_from_history"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_bool_field(c.protocol_strip_think_from_history, v, e);
-    };
-    t["protocol.stop_sequences"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.protocol_stop_sequences, v, e);
-    };
-
-    t["agent.system_prompt_file"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.agent_system_prompt_file, v, e);
-    };
-    t["agent.max_iterations"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.agent_max_iterations, v, e);
-    };
-    t["agent.repetition_threshold"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.agent_repetition_threshold, v, e);
-    };
-    t["agent.work_dir"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.agent_work_dir, v, e);
-    };
-    t["agent.transcript_log_path"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.agent_transcript_log_path, v, e);
-    };
-    t["agent.transcript_max_bytes"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_long_field(c.agent_transcript_max_bytes, v, e);
-    };
-    t["agent.log_level"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_enum_field(c.agent_log_level, v, {"error", "warn", "info", "debug"}, e);
-    };
-    t["agent.mode"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_enum_field(c.agent_mode, v, {"interactive", "oneshot"}, e);
-    };
-    t["agent.color_output"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_enum_field(c.agent_color_output, v, {"auto", "always", "never"}, e);
-    };
-
-    t["tools.bash_timeout_s"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.tools_bash_timeout_s, v, e);
-    };
-    t["tools.output_head_lines"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.tools_output_head_lines, v, e);
-    };
-    t["tools.output_tail_lines"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.tools_output_tail_lines, v, e);
-    };
-    t["tools.output_max_bytes"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.tools_output_max_bytes, v, e);
-    };
-    t["tools.command_filter_mode"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_enum_field(c.tools_command_filter_mode, v, {"whitelist", "blacklist", "none"}, e);
-    };
-    t["tools.whitelist"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.tools_whitelist, v, e);
-    };
-    t["tools.blacklist"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.tools_blacklist, v, e);
-    };
-    t["tools.on_blocked_command"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_enum_field(c.tools_on_blocked_command, v, {"ask", "deny"}, e);
-    };
-    t["tools.confirm_mode"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_enum_field(c.tools_confirm_mode, v, {"always", "never"}, e);
-    };
-    t["tools.allow_metacharacters"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_bool_field(c.tools_allow_metacharacters, v, e);
-    };
-
-    t["skills.skills_dir"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_string_field(c.skills_skills_dir, v, e);
-    };
-    t["skills.tier1_enabled"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_bool_field(c.skills_tier1_enabled, v, e);
-    };
-    t["skills.max_tier1_skills"] = [](Config &c, const std::string &v, std::string &e) {
-        return set_int_field(c.skills_max_tier1_skills, v, e);
-    };
-
-    return t;
+    known = false;
+    return false;
 }
 
 struct CliOverrides
@@ -307,6 +259,17 @@ struct CliOverrides
     bool has_version = false;
     bool has_resume = false;
     std::string resume_path;
+    bool has_resume_prompt = false;
+    std::string resume_prompt;
+    bool has_resume_work_dir = false;
+    std::string resume_work_dir;
+    bool has_session = false;
+    std::string session;
+    bool has_list_sessions = false;
+    bool has_rename_to = false;
+    std::string rename_to;
+    bool has_positional_task = false;
+    std::string positional_task;
 };
 
 enum
@@ -316,7 +279,12 @@ enum
     OPT_DRY_RUN = 1003,
     OPT_VERSION = 1004,
     OPT_HELP = 1005,
-    OPT_RESUME = 1006
+    OPT_RESUME = 1006,
+    OPT_RESUME_PROMPT = 1007,
+    OPT_RESUME_WORK_DIR = 1008,
+    OPT_SESSION = 1009,
+    OPT_LIST_SESSIONS = 1010,
+    OPT_RENAME_TO = 1011
 };
 
 CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings)
@@ -333,6 +301,11 @@ CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings
                                               {"version", no_argument, nullptr, OPT_VERSION},
                                               {"help", no_argument, nullptr, OPT_HELP},
                                               {"resume", required_argument, nullptr, OPT_RESUME},
+                                              {"resume-prompt", required_argument, nullptr, OPT_RESUME_PROMPT},
+                                              {"resume-work-dir", required_argument, nullptr, OPT_RESUME_WORK_DIR},
+                                              {"session", required_argument, nullptr, OPT_SESSION},
+                                              {"list-sessions", no_argument, nullptr, OPT_LIST_SESSIONS},
+                                              {"rename-to", required_argument, nullptr, OPT_RENAME_TO},
                                               {nullptr, 0, nullptr, 0}};
 
     optind = 1; // reset getopt's global state -- load_config may be called repeatedly in tests
@@ -381,10 +354,49 @@ CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings
             o.has_resume = true;
             o.resume_path = optarg;
             break;
+        case OPT_RESUME_PROMPT:
+            o.has_resume_prompt = true;
+            o.resume_prompt = optarg;
+            break;
+        case OPT_RESUME_WORK_DIR:
+            o.has_resume_work_dir = true;
+            o.resume_work_dir = optarg;
+            break;
+        case OPT_SESSION:
+            o.has_session = true;
+            o.session = optarg;
+            break;
+        case OPT_LIST_SESSIONS:
+            o.has_list_sessions = true;
+            break;
+        case OPT_RENAME_TO:
+            o.has_rename_to = true;
+            o.rename_to = optarg;
+            break;
         case '?':
         default:
             warnings.push_back(std::string("unrecognized CLI option near index ") + std::to_string(optind));
             break;
+        }
+    }
+
+    // SPEC.md §12's positional [task]: everything left after the options is
+    // joined with single spaces into one task string. -p/--prompt wins (and
+    // implies oneshot); a bare positional task leaves `mode` as configured,
+    // i.e. "run this, then stay interactive".
+    if (!o.has_prompt && optind < argc)
+    {
+        std::string task;
+        for (int i = optind; i < argc; ++i)
+        {
+            if (!task.empty())
+                task += " ";
+            task += argv[i];
+        }
+        if (!task.empty())
+        {
+            o.has_positional_task = true;
+            o.positional_task = task;
         }
     }
     return o;
@@ -413,19 +425,22 @@ ConfigLoadResult load_config(int argc, char **argv, Config &out)
     if (!file_found)
         result.warnings.push_back("config file not found: " + out.cli_config_path + " -- using built-in defaults");
 
-    static const std::map<std::string, Setter> key_table = build_key_table();
     for (const auto &entry : kv)
     {
-        auto it = key_table.find(entry.first);
-        if (it == key_table.end())
-        {
-            result.warnings.push_back("unknown config key: " + entry.first);
-            continue;
-        }
         std::string err;
-        if (!it->second(out, entry.second, err))
+        bool known = true;
+        if (apply_key(out, entry.first, entry.second, err, known))
+            continue;
+        if (known)
             result.warnings.push_back("config key '" + entry.first + "': " + err + " -- keeping default");
+        else
+            result.warnings.push_back("unknown config key: " + entry.first);
     }
+
+    // Whether the transcript path was chosen deliberately. A session name
+    // (or the generated default) only decides the path when it was not
+    // (SPEC.md §12.3), so existing configs and tests keep their own file.
+    out.cli_transcript_path_explicit = kv.find("agent.transcript_log_path") != kv.end();
 
     // CLI overrides last -- CLI > file > default.
     if (cli.has_model)
@@ -450,10 +465,89 @@ ConfigLoadResult load_config(int argc, char **argv, Config &out)
         out.cli_task_prompt = cli.prompt;
         out.agent_mode = "oneshot";
     }
+    else if (cli.has_positional_task)
+    {
+        out.cli_task_prompt = cli.positional_task; // mode untouched: §12's "[task]"
+    }
     out.cli_help_requested = cli.has_help;
     out.cli_version_requested = cli.has_version;
+    if (cli.has_session)
+        out.cli_session_name = cli.session;
+    out.cli_list_sessions = cli.has_list_sessions;
+    if (cli.has_rename_to)
+        out.cli_rename_to = cli.rename_to;
     if (cli.has_resume)
+    {
         out.cli_resume_path = cli.resume_path;
+        // A resumed session continues IN ITS OWN log: the transcript being
+        // replayed becomes the transcript being written, so one file remains
+        // the complete record of that session (SPEC.md §12.2). CLI beats the
+        // config file here, same as every other override.
+        out.agent_transcript_log_path = cli.resume_path;
+    }
+    if (cli.has_resume_work_dir)
+    {
+        if (is_one_of(cli.resume_work_dir, {"ask", "continue", "quit"}))
+            out.cli_resume_work_dir_policy = cli.resume_work_dir;
+        else
+            result.warnings.push_back("--resume-work-dir: invalid value '" + cli.resume_work_dir +
+                                      "' (ask|continue|quit); falling back to the default");
+    }
+    if (cli.has_resume_prompt)
+    {
+        if (is_one_of(cli.resume_prompt, {"ask", "update", "quit"}))
+            out.cli_resume_prompt_policy = cli.resume_prompt;
+        else
+            result.warnings.push_back("--resume-prompt: invalid value '" + cli.resume_prompt +
+                                      "' (ask|update|quit); falling back to the default");
+    }
+
+    // skills.skill_checks is a set, not an enum, so it is validated here
+    // rather than by the enum table: an unknown token is dropped with a
+    // warning instead of silently disabling a safeguard the operator asked
+    // for (SPEC.md §7.1).
+    {
+        std::vector<std::string> kept;
+        for (const auto &token : split_trimmed(out.skills_skill_checks, ','))
+            if (token == "none" || token == "filter_on_create" || token == "confirm_on_create" ||
+                token == "filter_at_startup")
+                kept.push_back(token);
+            else
+                result.warnings.push_back("skills.skill_checks: unknown value '" + token + "' ignored");
+        std::string normalized;
+        for (const auto &token : kept)
+            normalized += (normalized.empty() ? "" : ",") + token;
+        out.skills_skill_checks = normalized;
+    }
+
+    // A cap has to fit at least one entry plus the cutoff marker (~131 bytes)
+    // or the transcript comes out empty: the first entry already overflows and
+    // the marker that would explain it does not fit either. Warn loudly rather
+    // than let a plausible-looking small number silently disable diagnostics.
+    const long kMinUsefulTranscriptBytes = 256;
+    if (out.agent_transcript_max_bytes > 0 && out.agent_transcript_max_bytes < kMinUsefulTranscriptBytes)
+        result.warnings.push_back("agent.transcript_max_bytes=" + std::to_string(out.agent_transcript_max_bytes) +
+                                  " is below the " + std::to_string(kMinUsefulTranscriptBytes) +
+                                  " bytes needed for one entry plus the cutoff marker: the transcript may stay empty");
+    if (out.agent_transcript_max_bytes_per_run > 0 &&
+        out.agent_transcript_max_bytes_per_run < kMinUsefulTranscriptBytes)
+        result.warnings.push_back(
+            "agent.transcript_max_bytes_per_run=" + std::to_string(out.agent_transcript_max_bytes_per_run) +
+            " is below the " + std::to_string(kMinUsefulTranscriptBytes) +
+            " bytes needed for one entry plus the cutoff marker: this run may log nothing");
+
+    // SPEC.md §9.2: the per-run cap lives inside the total-file cap, so a
+    // per-run value larger than the total is incoherent -- clamp it down and
+    // say so rather than letting one cap silently shadow the other. Only
+    // meaningful when both are enabled (0 = unlimited on either).
+    if (out.agent_transcript_max_bytes > 0 && out.agent_transcript_max_bytes_per_run > out.agent_transcript_max_bytes)
+    {
+        result.warnings.push_back("agent.transcript_max_bytes_per_run (" +
+                                  std::to_string(out.agent_transcript_max_bytes_per_run) +
+                                  ") exceeds agent.transcript_max_bytes (" +
+                                  std::to_string(out.agent_transcript_max_bytes) + "): clamping it to the total cap");
+        out.agent_transcript_max_bytes_per_run = out.agent_transcript_max_bytes;
+    }
 
     // SPEC.md §6.3: fenced + grammar -> warn and ignore (grammar has no effect).
     if (out.protocol_enable_grammar && out.protocol_tool_protocol == "fenced")

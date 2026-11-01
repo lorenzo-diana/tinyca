@@ -238,6 +238,57 @@ void test_round_trip_encode_then_decode_canned_response()
     TINYCA_CHECK_EQ(decoded.content, std::string("hi there"));
 }
 
+// A1: the stop reason has to survive decoding, in both wire shapes, or the
+// agent cannot tell a complete reply from one cut at max_tokens.
+void test_finish_reason_is_decoded()
+{
+    tinyca::OpenAIChatCodec codec;
+    std::string err;
+
+    tinyca::Message cut;
+    TINYCA_CHECK(codec.decode_response(
+        R"({"choices":[{"message":{"role":"assistant","content":"```bash\nls -l"},"finish_reason":"length"}]})", cut,
+        err));
+    TINYCA_CHECK_EQ(cut.finish_reason, std::string("length"));
+
+    tinyca::Message done;
+    TINYCA_CHECK(codec.decode_response(
+        R"({"choices":[{"message":{"role":"assistant","content":"all set"},"finish_reason":"stop"}]})", done, err));
+    TINYCA_CHECK_EQ(done.finish_reason, std::string("stop"));
+
+    // Native /completion reports a max-token cutoff as "stopped_limit".
+    tinyca::Message native;
+    TINYCA_CHECK(codec.decode_response(R"({"content":"half a comm","stopped_limit":true})", native, err));
+    TINYCA_CHECK_EQ(native.finish_reason, std::string("length"));
+
+    // Streamed: the final chunk carries it.
+    tinyca::Message streamed;
+    TINYCA_CHECK(codec.decode_stream_chunk(R"({"choices":[{"delta":{"content":"hi"}}]})", streamed, err));
+    TINYCA_CHECK(codec.decode_stream_chunk(R"({"choices":[{"delta":{},"finish_reason":"length"}]})", streamed, err));
+    TINYCA_CHECK_EQ(streamed.finish_reason, std::string("length"));
+}
+
+// B1: the streamed tool_call index sizes an allocation, so an implausible one
+// must be refused rather than reserved. Guards a defect where index 2000000
+// allocated 2,000,001 ToolCalls (~183 MiB) from a single chunk.
+void test_stream_tool_call_index_is_bounded()
+{
+    tinyca::OpenAIChatCodec codec;
+    tinyca::Message acc;
+    std::string err;
+
+    TINYCA_CHECK(!codec.decode_stream_chunk(
+        R"({"choices":[{"delta":{"tool_calls":[{"index":2000000,"function":{"name":"bash"}}]}}]})", acc, err));
+    TINYCA_CHECK(acc.tool_calls.empty());
+    TINYCA_CHECK(err.find("exceeds the maximum") != std::string::npos);
+
+    // A plausible parallel-call index still works.
+    tinyca::Message ok_acc;
+    TINYCA_CHECK(codec.decode_stream_chunk(
+        R"({"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"name":"bash"}}]}}]})", ok_acc, err));
+    TINYCA_CHECK_EQ(ok_acc.tool_calls.size(), static_cast<size_t>(3));
+}
+
 void run_all_tests()
 {
     TINYCA_RUN(test_encode_chat_mode_basic_shape);
@@ -251,6 +302,8 @@ void run_all_tests()
     TINYCA_RUN(test_decode_stream_chunk_accumulates_content_and_tool_calls);
     TINYCA_RUN(test_decode_stream_chunk_native_completion_shape);
     TINYCA_RUN(test_round_trip_encode_then_decode_canned_response);
+    TINYCA_RUN(test_finish_reason_is_decoded);
+    TINYCA_RUN(test_stream_tool_call_index_is_bounded);
 }
 
 } // namespace

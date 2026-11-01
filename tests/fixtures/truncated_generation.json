@@ -1,0 +1,8 @@
+{
+  "scenario": "truncated_generation",
+  "responses": [
+    {"content": "```bash\ncat report.txt && echo lin",
+     "finish_reason": "length"},
+    {"content": "I will stop here."}
+  ]
+}

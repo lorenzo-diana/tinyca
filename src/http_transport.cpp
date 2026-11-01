@@ -76,6 +76,13 @@ void HttpTransport::cancel()
         active_client_->stop();
 }
 
+// AUDIT NOTE on cancellation (SPEC.md §9.1): cancel() can only reach a client
+// that is currently registered via set_active(). A stop request landing
+// before set_active(&cli) or after set_active(nullptr) is therefore dropped
+// at this layer by design -- the agent loop re-checks
+// ControlThread::stop_requested() at the top of every iteration
+// (src/agent.cpp), so such a request still stops the task at the next loop
+// boundary instead of being lost outright.
 HttpResponse HttpTransport::post(const std::string &path, const std::string &body,
                                  const std::vector<std::pair<std::string, std::string>> &headers)
 {
@@ -122,7 +129,6 @@ HttpResponse HttpTransport::post_stream(const std::string &path, const std::stri
         return true;
     };
 
-    httplib::Response res;
     auto result = cli.send(req);
     set_active(nullptr);
 
