@@ -305,6 +305,8 @@ struct CliOverrides
     bool has_verbose = false;
     bool has_help = false;
     bool has_version = false;
+    bool has_resume = false;
+    std::string resume_path;
 };
 
 enum
@@ -313,7 +315,8 @@ enum
     OPT_NO_CONFIRM = 1002,
     OPT_DRY_RUN = 1003,
     OPT_VERSION = 1004,
-    OPT_HELP = 1005
+    OPT_HELP = 1005,
+    OPT_RESUME = 1006
 };
 
 CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings)
@@ -329,6 +332,7 @@ CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings
                                               {"verbose", no_argument, nullptr, 'v'},
                                               {"version", no_argument, nullptr, OPT_VERSION},
                                               {"help", no_argument, nullptr, OPT_HELP},
+                                              {"resume", required_argument, nullptr, OPT_RESUME},
                                               {nullptr, 0, nullptr, 0}};
 
     optind = 1; // reset getopt's global state -- load_config may be called repeatedly in tests
@@ -372,6 +376,10 @@ CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings
             break;
         case OPT_HELP:
             o.has_help = true;
+            break;
+        case OPT_RESUME:
+            o.has_resume = true;
+            o.resume_path = optarg;
             break;
         case '?':
         default:
@@ -444,6 +452,8 @@ ConfigLoadResult load_config(int argc, char **argv, Config &out)
     }
     out.cli_help_requested = cli.has_help;
     out.cli_version_requested = cli.has_version;
+    if (cli.has_resume)
+        out.cli_resume_path = cli.resume_path;
 
     // SPEC.md §6.3: fenced + grammar -> warn and ignore (grammar has no effect).
     if (out.protocol_enable_grammar && out.protocol_tool_protocol == "fenced")

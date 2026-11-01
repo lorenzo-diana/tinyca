@@ -25,8 +25,68 @@
 #include "tinyca/skills.h"
 #include "tinyca/string_util.h"
 
+#include "json.hpp"
+
 namespace
 {
+
+// Simplest possible resume: replay a prior transcript.jsonl's user/assistant/
+// tool turns back into `history`, in order. Ignores "request" lines (a
+// derived re-encoding of history, not new state) and never replays the old
+// system message -- the caller's current system_prompt.txt/skills always win.
+// Deliberately minimal (SPEC.md has no resume format yet) so it's easy to
+// swap for a different resume strategy later.
+bool load_history_from_transcript(const std::string &path, std::vector<tinyca::Message> &history, std::string &err)
+{
+    std::ifstream in(path);
+    if (!in)
+    {
+        err = "cannot open transcript file: " + path;
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.empty())
+            continue;
+        nlohmann::json j;
+        try
+        {
+            j = nlohmann::json::parse(line);
+        }
+        catch (...)
+        {
+            continue; // skip malformed/truncated lines (e.g. a cutoff marker)
+        }
+        std::string kind = j.value("kind", "");
+        if (!j.contains("payload"))
+            continue;
+        const nlohmann::json &payload = j["payload"];
+
+        tinyca::Message m;
+        if (kind == "user_task")
+        {
+            m.role = "user";
+            m.content = payload.value("text", "");
+        }
+        else if (kind == "response")
+        {
+            m.role = "assistant";
+            m.content = payload.value("content", "");
+        }
+        else if (kind == "tool_result")
+        {
+            m.role = "tool";
+            m.content = payload.value("content", "");
+        }
+        else
+        {
+            continue;
+        }
+        history.push_back(m);
+    }
+    return true;
+}
 
 using namespace tinyca;
 
@@ -218,6 +278,7 @@ void print_help()
                  "      --no-confirm        confirm_mode = never\n"
                  "      --dry-run           parse and print actions, execute nothing\n"
                  "  -v, --verbose           log_level = debug\n"
+                 "      --resume <file>     replay a prior transcript.jsonl as starting history\n"
                  "      --version, --help\n"
                  "\n"
                  "Interactive commands: /reset /skills /history /toggle_show_thinking /help /quit\n";
@@ -361,6 +422,15 @@ int main(int argc, char **argv)
 
     std::vector<Message> history;
     history.push_back(system_message);
+
+    if (!config.cli_resume_path.empty())
+    {
+        std::string resume_err;
+        if (!load_history_from_transcript(config.cli_resume_path, history, resume_err))
+            std::cerr << "warning: --resume: " << resume_err << " -- starting a fresh session\n";
+        else
+            std::cerr << "resumed " << (history.size() - 1) << " message(s) from " << config.cli_resume_path << "\n";
+    }
 
     // If streaming was on, the final text was already shown live via
     // on_assistant_text_chunk_ -- printing `result` again would duplicate

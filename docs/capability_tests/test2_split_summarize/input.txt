@@ -1,0 +1,5 @@
+The Jetson Nano is a small single-board computer made by NVIDIA. It has a quad-core ARM processor and a 128-core Maxwell GPU. Despite its age, it remains popular for embedded machine learning projects because of its low cost and compact size.
+
+Bubble sort is one of the simplest sorting algorithms taught in computer science courses. It repeatedly steps through a list, compares adjacent elements, and swaps them if they are in the wrong order. Although easy to understand, it is inefficient for large datasets compared to algorithms like quicksort or mergesort.
+
+A hotspot is a feature on a mobile phone that lets other devices connect to the internet through the phone's own cellular or WiFi connection. Hotspots are convenient for providing temporary internet access to a laptop or another device when no other network is available nearby.

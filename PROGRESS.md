@@ -545,3 +545,47 @@ D7 run, not hypothetical):
 Architecture note for future work: §15's bold-yellow "requested action" colour
 has no live call site (D6.5's known, documented gap) — `Agent` doesn't expose a
 pre-execution hook the way it does for streamed text. Cosmetic only.
+
+## 2026-10-31T16:07Z — post-D8 capability tests (not a numbered phase)
+
+Three real end-to-end tasks run against the real `llama-server` +
+Qwen2.5-Coder-1.5B on the Jetson, in a dedicated sandbox config
+(`command_filter_mode = none`, `allow_metacharacters = true` — SPEC.md §8.1's
+own sanctioned oneshot-sandbox exception, not a shipped-default change). Full
+writeup, transcripts, and generated artifacts in `docs/capability_tests/`.
+
+1. **Write/compile/run a sort algorithm** — genuine success on the 4th prompt
+   attempt (model wrote `sort.c`, compiled, ran it, correct output,
+   independently re-verified). Attempts 1-3 each failed differently (skipped
+   the write step and ran a nonexistent binary; wrote the file then emitted a
+   nonsense bare-filename "command") — each caught cleanly by the D6
+   repetition detector, no hang, no unsafe command.
+2. **Split a text file into per-paragraph files + summarize each** — genuine,
+   not-forced failure. Model produced the right filenames but generic
+   placeholder summary text unrelated to the actual paragraph content; a
+   narrower isolation attempt also failed (tried to `cat` a file it was
+   supposed to write). Confirms the SPEC.md §16 capability ceiling: mechanical
+   file ops work, content-level reasoning doesn't.
+3. **Write/run a Fibonacci script** (added test, not in the original brief) —
+   genuine, reproducible failure, and the most significant finding of the
+   three. First attempt produced a **fully empty generation**
+   (`content:"" tool_calls:[]`) on a longer prompt — confirmed not an infra
+   issue (`llama-server` healthy throughout). This reproduces and resolves the
+   D7 "transient empty response" note above: it recurs on real hardware, is
+   handled safely by the existing empty→blank-final-answer path, and is a
+   genuine model behavior rather than a one-off. Later attempts wrote a
+   `fibonacci()` with a real bug (returns a scalar, not the sequence) and then
+   — on a prompt structurally identical to the one that worked for the sort
+   test — **fabricated a plausible success message claiming the correct
+   output without ever running the script**. The buggy code was deterministic
+   across separate runs at `temperature=0.2`. Independently re-running the
+   model's `fib.py` confirms the bug (`TypeError: 'int' object is not
+   iterable`).
+
+**New finding beyond D7**: a model that confidently reports a result it never
+produced is a sharper risk than one that errors or loops — no command filter
+or repetition threshold is designed to catch a fabricated success message,
+only a repeated or malformed command. Flagging honestly as an open capability
+gap, not something this phase attempts to fix; the architecture's existing
+safety nets (repetition detector, command filter, graceful empty-response
+handling) held correctly across all 12 attempts total.

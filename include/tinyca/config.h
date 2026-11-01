@@ -68,6 +68,7 @@ struct Config
     bool cli_help_requested = false;                     // --help
     bool cli_version_requested = false;                  // --version
     std::string cli_config_path = "./config/tinyca.ini"; // -c/--config
+    std::string cli_resume_path;                         // --resume <transcript.jsonl>; empty = fresh session
 };
 
 struct ConfigLoadResult
