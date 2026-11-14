@@ -2,7 +2,7 @@
 //
 // CLI entry point: argument/config loading, system prompt + skills assembly,
 // wiring every component together, and the interactive REPL (SPEC.md §12)
-// with TAB completion (§12.1) and colored output (§15).
+// with line editing (§12.1), colored output (§15) and a status bar (§15.1).
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -17,6 +17,7 @@
 #include <sstream>
 
 #include "tinyca/agent.h"
+#include "tinyca/appearance.h"
 #include "tinyca/codec.h"
 #include "tinyca/command_filter.h"
 #include "tinyca/config.h"
@@ -25,10 +26,12 @@
 #include "tinyca/fenced_protocol.h"
 #include "tinyca/hermes_protocol.h"
 #include "tinyca/http_transport.h"
+#include "tinyca/line_editor.h"
 #include "tinyca/logger.h"
 #include "tinyca/resume.h"
 #include "tinyca/session.h"
 #include "tinyca/skills.h"
+#include "tinyca/status_bar.h"
 #include "tinyca/string_util.h"
 
 #include "json.hpp"
@@ -77,46 +80,63 @@ std::string read_file_or_empty(const std::string &path, bool &found)
     return ss.str();
 }
 
-// ---- terminal color (SPEC.md §15) ----
+// ---- terminal output (SPEC.md §15) ----
+//
+// Styling itself lives in appearance.{h,cpp}; what belongs here is only how a
+// line is painted: the style goes at the START of every line and is reset at
+// the end, so a background fills each line of a block instead of stopping at
+// the first newline, and never leaks into whatever is printed next.
 
-struct Colors
-{
-    bool enabled = false;
-    const char *user_input() const
-    {
-        return enabled ? "\x1b[1;36m" : "";
-    }
-    const char *think() const
-    {
-        return enabled ? "\x1b[2;37m" : "";
-    }
-    const char *assistant() const
-    {
-        return enabled ? "\x1b[32m" : "";
-    }
-    const char *action() const
-    {
-        return enabled ? "\x1b[1;33m" : "";
-    }
-    const char *reset() const
-    {
-        return enabled ? "\x1b[0m" : "";
-    }
-};
+// Paints one line. With a background, ESC[K clears to the end of the line
+// first, so the band spans the terminal width rather than just the text.
+// Whether the next byte written to stdout would land at column 0. Only the
+// streamed channels can leave the cursor mid-line, and a console message that
+// lands there continues the model's sentence -- so this is tracked rather than
+// guessed, and `\n` is emitted only when it is actually needed.
+bool g_at_line_start = true;
 
-Colors resolve_colors(const std::string &mode)
+// TinyCA's own informational lines ("new session: ...", "resumed 4 messages").
+// Not warnings, not the model: their own style, on stderr, so piping the
+// agent's answer somewhere does not carry the chatter with it.
+void notice(const Appearance &style, const std::string &text)
 {
-    Colors c;
-    if (mode == "always")
-        c.enabled = true;
-    else if (mode == "never")
-        c.enabled = false;
-    else
-        c.enabled = isatty(STDOUT_FILENO) != 0;
-    return c;
+    const char *reset = style.notice.empty() ? "" : "\x1b[0m";
+    std::cerr << style.notice << text << reset << "\n";
 }
 
-// ---- TAB-completing line editor (SPEC.md §12.1) ----
+void print_styled_line(const std::string &style, bool has_background, const std::string &line)
+{
+    g_at_line_start = true;
+    if (style.empty())
+    {
+        std::cout << line << "\n";
+        return;
+    }
+    std::cout << style << line << (has_background ? "\x1b[K" : "") << "\x1b[0m\n";
+}
+
+// `prefix` is applied to EVERY line, not just the first: a block indented only
+// on its opening line reads as a quote that lost its shape.
+void print_styled_block(const std::string &style, bool has_background, const std::string &text,
+                        const std::string &prefix = std::string())
+{
+    for (const auto &line : split(text, '\n'))
+        print_styled_line(style, has_background, prefix + line);
+}
+
+// A plain yes/no question, for decisions that are not about a command.
+bool ask_yes_no(const std::string &question)
+{
+    std::cout << "\n" << question << " [y/N] " << std::flush;
+    std::string response;
+    if (!std::getline(std::cin, response))
+        return false;
+    return !response.empty() && (response[0] == 'y' || response[0] == 'Y');
+}
+
+// ---- Line editor: raw mode, redraw and completion (SPEC.md §12.1) ----
+// Key decoding and the edit buffer live in line_editor.h, free of any
+// terminal; what is left here is what genuinely needs one.
 
 class LineEditor
 {
@@ -127,12 +147,23 @@ class LineEditor
     {
     }
 
-    // Returns false on EOF (Ctrl+D / closed stdin).
+    // Pre-loads lines the user typed in an earlier run of this session, so
+    // that after --resume the up arrow walks the conversation that was
+    // restored instead of starting empty -- the restored history is on screen
+    // and in the model's context, so not having it under the arrow keys was
+    // the odd one out.
+    void seed_history(const std::vector<std::string> &lines)
+    {
+        for (size_t i = 0; i < lines.size(); ++i)
+            history_.add(lines[i]);
+    }
+
+    // Returns false on EOF (Ctrl+D on an empty line, or closed stdin).
     //
     // Raw mode is entered and restored inside this call, so the terminal is
     // only ever raw while a line is being typed. There is no cancel key:
-    // SIGINT is blocked in every thread (ControlThread::start) and consumed
-    // by sigwait, so Ctrl+C typed at this prompt aborts no task -- it is the
+    // SIGINT is blocked in every thread (ControlThread::start) and consumed by
+    // sigwait, so Ctrl+C typed at this prompt aborts no task -- it is the
     // control thread's, and there is no task in flight while we are here.
     bool read_line(const std::string &prompt, std::string &out)
     {
@@ -142,7 +173,6 @@ class LineEditor
             return static_cast<bool>(std::getline(std::cin, out));
         }
 
-        std::cout << prompt << std::flush;
         termios orig;
         tcgetattr(STDIN_FILENO, &orig);
         termios raw = orig;
@@ -151,68 +181,138 @@ class LineEditor
         raw.c_cc[VTIME] = 0;
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
 
-        std::string line;
+        EditBuffer buffer;
+        KeyDecoder decoder;
+        const size_t prompt_width = display_width(prompt);
+        redraw(prompt, prompt_width, buffer);
+
         bool eof = false;
         while (true)
         {
             char c = 0;
-            ssize_t n = read(STDIN_FILENO, &c, 1);
+            const ssize_t n = read(STDIN_FILENO, &c, 1);
             if (n <= 0)
             {
                 eof = true;
                 break;
             }
-            if (c == '\n' || c == '\r')
+
+            KeyEvent key;
+            if (!decoder.feed(c, key))
+                continue; // mid escape sequence
+
+            if (key.key == Key::Enter)
             {
                 std::cout << "\n";
                 break;
             }
-            if (c == 127 || c == 8) // backspace / DEL
+            if (key.key == Key::Eof && buffer.text.empty())
             {
-                if (!line.empty())
-                {
-                    line.pop_back();
-                    std::cout << "\b \b" << std::flush;
-                }
+                eof = true;
+                break;
+            }
+            if (key.key == Key::Tab)
+            {
+                complete_in_place(prompt, prompt_width, buffer);
                 continue;
             }
-            if (c == '\t')
-            {
-                std::vector<std::string> matches = complete(line);
-                if (matches.size() == 1)
-                {
-                    std::string suffix = matches[0].substr(line.size());
-                    line += suffix;
-                    std::cout << suffix << std::flush;
-                }
-                else if (matches.size() > 1)
-                {
-                    std::cout << "\n";
-                    for (const auto &m : matches)
-                        std::cout << m << "  ";
-                    std::cout << "\n" << prompt << line << std::flush;
-                }
-                continue;
-            }
-            if (c >= 32 && c < 127)
-            {
-                line += c;
-                std::cout << c << std::flush;
-            }
+            if (!apply(key, buffer))
+                continue; // nothing moved, nothing to redraw
+
+            redraw(prompt, prompt_width, buffer);
         }
 
         tcsetattr(STDIN_FILENO, TCSANOW, &orig);
-        out = line;
+        out = buffer.text;
+        history_.add(out);
         return !eof;
     }
 
   private:
+    // Applies one key. Returns whether the line or the cursor moved, i.e.
+    // whether a redraw is needed.
+    bool apply(const KeyEvent &key, EditBuffer &buffer)
+    {
+        switch (key.key)
+        {
+        case Key::Char:
+            buffer.insert(key.ch);
+            return true;
+        case Key::Backspace:
+            buffer.backspace();
+            return true;
+        case Key::Delete:
+            buffer.erase_at();
+            return true;
+        case Key::Left:
+            buffer.move_left();
+            return true;
+        case Key::Right:
+            buffer.move_right();
+            return true;
+        case Key::Home:
+            buffer.move_home();
+            return true;
+        case Key::End:
+            buffer.move_end();
+            return true;
+        case Key::KillToStart:
+            buffer.kill_to_start();
+            return true;
+        case Key::KillToEnd:
+            buffer.kill_to_end();
+            return true;
+        case Key::KillWordBack:
+            buffer.kill_word_back();
+            return true;
+        case Key::Up:
+            return history_.previous(buffer);
+        case Key::Down:
+            return history_.next(buffer);
+        default:
+            return false;
+        }
+    }
+
+    // Repaints the line: carriage return, prompt, text, erase to end of line,
+    // then place the cursor. Erasing matters -- after a backspace or a shorter
+    // history entry the old tail would otherwise stay on screen. The cursor
+    // column counts the prompt's VISIBLE width, so its colour codes do not
+    // push the cursor to the right.
+    void redraw(const std::string &prompt, size_t prompt_width, const EditBuffer &buffer)
+    {
+        std::cout << "\r" << prompt << buffer.text << "\x1b[K\r";
+        const size_t column = prompt_width + buffer.cursor;
+        if (column > 0)
+            std::cout << "\x1b[" << column << "C";
+        std::cout << std::flush;
+    }
+
+    void complete_in_place(const std::string &prompt, size_t prompt_width, EditBuffer &buffer)
+    {
+        // Completion applies to the text before the cursor -- what is being
+        // typed -- and leaves anything after it alone.
+        const std::string typed = buffer.text.substr(0, buffer.cursor);
+        const std::vector<std::string> matches = complete(typed);
+        if (matches.size() == 1)
+        {
+            const std::string suffix = matches[0].substr(typed.size());
+            for (size_t i = 0; i < suffix.size(); ++i)
+                buffer.insert(suffix[i]);
+        }
+        else if (matches.size() > 1)
+        {
+            std::cout << "\n";
+            for (const auto &m : matches)
+                std::cout << m << "  ";
+            std::cout << "\n";
+        }
+        redraw(prompt, prompt_width, buffer);
+    }
+
     std::vector<std::string> complete(const std::string &line) const
     {
         std::vector<std::string> candidates;
-        // "/rename <TAB>" completes stored session names -- renaming to a name
-        // that is already taken is the one error this command can make, so
-        // showing the taken ones is the useful completion (SPEC.md §12.1).
         const std::string rename_prefix = "/rename ";
         if (starts_with(line, rename_prefix))
         {
@@ -231,7 +331,7 @@ class LineEditor
         else if (starts_with(line, "show_skill:"))
         {
             const std::string prefix = "show_skill:";
-            std::string typed = line.substr(prefix.size());
+            const std::string typed = line.substr(prefix.size());
             for (const auto &s : skill_names_)
                 if (starts_with(s, typed))
                     candidates.push_back(prefix + s);
@@ -242,11 +342,23 @@ class LineEditor
     std::vector<std::string> commands_;
     std::vector<std::string> skill_names_;
     std::vector<std::string> session_names_;
+    InputHistory history_;
 };
 
-bool confirm_prompt(const std::string &message)
+// Shows a command awaiting approval as a block of its own: why it is being
+// asked, then every line of the command, then the question.
+//
+// Nothing is elided. A script that runs to forty lines is shown in forty
+// lines, because the decision being asked for is about the whole thing, and a
+// half-shown script is how you approve something you did not read. It is
+// printed from the parsed command rather than from whatever the live stream
+// happened to show, so streaming cannot affect it.
+bool confirm_command(const Appearance &style, const std::string &reason, const std::string &command)
 {
-    std::cout << "\n" << message << " [y/N] " << std::flush;
+    print_styled_line(style.confirm, style.confirm_has_background, "  command awaiting your approval -- " + reason);
+    print_styled_block(style.confirm, style.confirm_has_background, command, "  ");
+    std::cout << style.confirm << "  run it? [y/N]" << (style.confirm.empty() ? "" : "\x1b[0m") << " " << std::flush;
+
     std::string response;
     if (!std::getline(std::cin, response))
         return false;
@@ -276,7 +388,16 @@ void print_help()
                  "      --version, --help\n"
                  "\n"
                  "Interactive commands: /reset /skills /sessions /rename <name> /history\n"
-                 "                      /toggle_show_thinking /help /quit\n";
+                 "                      /toggle_show_thinking /help /quit\n"
+                 "  show_skill: <name>    print a skill's source and add it to the conversation\n"
+                 "                        (needs skills.tier2_enabled)\n"
+                 "  TAB completes slash commands, skill names after show_skill:, and\n"
+                 "  session names after /rename.\n"
+                 "\n"
+                 "Line editing: left/right move, Home/fn+left/Ctrl+A start, End/fn+right/\n"
+                 "  Ctrl+E end, up/down walk history (including the session's earlier\n"
+                 "  tasks), Delete/Backspace erase, Ctrl+W kills the word before the\n"
+                 "  cursor, Ctrl+U/Ctrl+K kill to start/end, Ctrl+D quits on an empty line.\n";
 }
 
 // skills.skill_checks is a comma-separated set (SPEC.md §7.1).
@@ -347,8 +468,8 @@ std::string build_system_prompt(const Config &config, SkillRegistry &skills)
 // next to a turn that costs seconds of inference. Cheap enough to prefer over
 // tracking directory state, which would have to be invalidated correctly to be
 // worth anything.
-void register_new_skills(const Config &config, CommandFilter &filter, std::vector<std::string> &known_names,
-                         std::vector<std::string> &notes)
+void register_new_skills(const Config &config, const Appearance &style, CommandFilter &filter,
+                         std::vector<std::string> &known_names, std::vector<std::string> &notes)
 {
     SkillRegistry rescanned;
     std::vector<std::string> rescan_warnings;
@@ -394,7 +515,7 @@ void register_new_skills(const Config &config, CommandFilter &filter, std::vecto
             filter.add_auto_allowed(token);
         notes.push_back("New skill available now: " + found.name + " -- " + found.description +
                         "\n  usage: " + found.usage);
-        std::cout << "(new skill registered: " << found.name << ")\n";
+        notice(style, "new skill registered: " + found.name);
     }
 }
 
@@ -443,7 +564,7 @@ bool resume_into(const Config &config, const std::string &system_prompt, const s
                              "re-sent to the model on the next request, which reprocesses the full prompt\n"
                              "(minutes on slow hardware). Answering no quits and leaves the transcript\n"
                              "untouched.\n";
-                policy = confirm_prompt("Update the system prompt and continue?") ? "update" : "quit";
+                policy = ask_yes_no("Update the system prompt and continue?") ? "update" : "quit";
             }
             if (policy == "quit")
             {
@@ -480,7 +601,7 @@ bool resume_into(const Config &config, const std::string &system_prompt, const s
                              "agent.work_dir = "
                           << session.stored_work_dir << " in your config.\n";
                 wd_policy =
-                    confirm_prompt("Continue in the current directory and update the session?") ? "continue" : "quit";
+                    ask_yes_no("Continue in the current directory and update the session?") ? "continue" : "quit";
             }
             if (wd_policy == "quit")
             {
@@ -570,7 +691,7 @@ void print_sessions(const std::string &sessions_dir, const std::string &current)
 // store and exit; neither needs a model, a work directory or a filter. Returns
 // the process exit code, or -1 for "this run is not a maintenance command,
 // carry on".
-int run_maintenance_command(const Config &config)
+int run_maintenance_command(const Config &config, const Appearance &style)
 {
     if (!config.cli_rename_to.empty())
     {
@@ -585,7 +706,7 @@ int run_maintenance_command(const Config &config)
             std::cerr << "fatal: --rename-to: " << rename_err << "\n";
             return 1;
         }
-        std::cout << "renamed session '" << config.cli_session_name << "' to '" << config.cli_rename_to << "'\n";
+        notice(style, "renamed session '" + config.cli_session_name + "' to '" + config.cli_rename_to + "'");
         return 0;
     }
 
@@ -606,8 +727,9 @@ int run_maintenance_command(const Config &config)
 //   otherwise              a new session named YYYY-MM-DD_hh-mm-ss_<work dir>
 // Every session therefore has a name, including the ones nobody named.
 // Returns false on an unusable --session name, which is fatal.
-bool resolve_session_file(Config &config, std::string &session_name)
+bool resolve_session_file(Config &config, const Appearance &style, std::string &session_name, bool &continued_existing)
 {
+    continued_existing = false;
     if (!config.cli_resume_path.empty())
     {
         if (!config.cli_session_name.empty())
@@ -645,8 +767,14 @@ bool resolve_session_file(Config &config, std::string &session_name)
         }
         session_name = config.cli_session_name;
         const bool existed = session_exists(config.agent_sessions_dir, session_name);
+        continued_existing = existed;
         config.agent_transcript_log_path = session_path(config.agent_sessions_dir, session_name);
-        std::cerr << (existed ? "continuing session: " : "new session: ") << session_name << "\n";
+        // "continuing" means the transcript is appended to, NOT that the
+        // conversation is replayed -- that is --resume (SPEC.md §12.2). Saying
+        // only "continuing" read as if the model remembered the session.
+        notice(style, existed ? "continuing session: " + session_name + " (appending to its transcript; --resume " +
+                                    session_name + " replays it into the conversation)"
+                              : "new session: " + session_name);
         return true;
     }
     if (!config.cli_transcript_path_explicit)
@@ -658,7 +786,7 @@ bool resolve_session_file(Config &config, std::string &session_name)
             unique_session_name(config.agent_sessions_dir, default_session_name(absolute_or_same(config.agent_work_dir),
                                                                                 static_cast<long>(time(nullptr))));
         config.agent_transcript_log_path = session_path(config.agent_sessions_dir, session_name);
-        std::cerr << "new session: " << session_name << "\n";
+        notice(style, "new session: " + session_name);
     }
     return true;
 }
@@ -700,6 +828,71 @@ void handle_show_skill(const std::string &line, const Config &config, const Skil
 }
 
 // Handles one REPL slash command. Returns false if the REPL should exit.
+// The name the SERVER reported for the model that answered, or empty if none
+// of the replies carried one. Searched backwards because the latest reply is
+// the authority: a server restarted mid-session can be serving something else.
+std::string last_served_model(const std::vector<Message> &history)
+{
+    for (size_t i = history.size(); i-- > 0;)
+        if (!history[i].served_model.empty())
+            return history[i].served_model;
+    return std::string();
+}
+
+// The lines a session had typed into it, for the REPL's up arrow. Only role
+// "user" qualifies: tool output is role "tool", and the system prompt is not
+// something anyone typed.
+std::vector<std::string> user_tasks_in(const std::vector<Message> &messages)
+{
+    std::vector<std::string> tasks;
+    for (size_t i = 0; i < messages.size(); ++i)
+        if (messages[i].role == "user")
+            tasks.push_back(messages[i].content);
+    return tasks;
+}
+
+// What an earlier run of this session left behind, read from its transcript:
+// the lines it typed and the options it changed. Loaded for BOTH ways of
+// coming back to a session -- `--resume <name>`, and `--session <name>` on an
+// existing transcript, which deliberately does not replay the conversation but
+// is still the same session.
+//
+// Returns false when there is nothing to read: a brand-new session, or an
+// unreadable transcript (reported in `err`, never fatal).
+bool load_previous_run(const Config &config, bool continued_existing_session, ResumedSession &out, std::string &err)
+{
+    if (config.cli_resume_path.empty() && !continued_existing_session)
+        return false;
+    // Both paths point agent_transcript_log_path at the session's own file
+    // (resolve_session_file), so one load covers them.
+    return load_session(config.agent_transcript_log_path, out, err);
+}
+
+// Re-applies the options that session recorded. Precedence is deliberate: a
+// value changed inside the session wins over the config file, because it is
+// the more recent and more specific statement of intent -- the config says how
+// sessions START, the transcript says how THIS one was left. Reported on
+// screen, so a setting that is not the configured one is never a surprise.
+void restore_session_options(const ResumedSession &previous, const Appearance &style, bool &show_thinking)
+{
+    bool stored = show_thinking;
+    std::string err;
+    if (resumed_bool_option(previous, "agent.show_thinking", stored, err) && stored != show_thinking)
+    {
+        show_thinking = stored;
+        notice(style, std::string("restored from this session: show_thinking = ") + (stored ? "on" : "off"));
+    }
+    if (!err.empty())
+        std::cerr << "warning: " << err << " -- keeping show_thinking = " << (show_thinking ? "on" : "off") << "\n";
+
+    // Forward compatibility: a transcript written by a later version can name
+    // options this one does not know. Saying so beats ignoring it in silence.
+    for (std::map<std::string, std::string>::const_iterator it = previous.options.begin(); it != previous.options.end();
+         ++it)
+        if (it->first != "agent.show_thinking")
+            notice(style, "this session recorded an option this build does not know: " + it->first);
+}
+
 bool handle_slash_command(const std::string &cmd, std::vector<Message> &history, const Message &system_message,
                           const SkillRegistry &skills, bool &show_thinking, const Config &config,
                           std::string &session_name, Logger &logger)
@@ -726,6 +919,11 @@ bool handle_slash_command(const std::string &cmd, std::vector<Message> &history,
     {
         show_thinking = !show_thinking;
         std::cout << "show_thinking: " << (show_thinking ? "on" : "off") << "\n";
+        // Recorded so the choice survives the session being reopened: an
+        // operator who turned reasoning on did so for this session, and having
+        // to redo it on every restart is what made the toggle feel temporary.
+        logger.transcript("option_change", "{\"key\":\"agent.show_thinking\",\"value\":" +
+                                               std::string(show_thinking ? "\"true\"" : "\"false\"") + "}");
     }
     else if (cmd == "/sessions")
     {
@@ -786,7 +984,11 @@ int main(int argc, char **argv)
 {
     Config config;
     ConfigLoadResult load_result = load_config(argc, argv, config);
+    std::vector<std::string> style_warnings;
+    const Appearance style = resolve_appearance(config, isatty(STDOUT_FILENO) != 0, style_warnings);
     for (const auto &w : load_result.warnings)
+        std::cerr << "warning: " << w << "\n";
+    for (const auto &w : style_warnings)
         std::cerr << "warning: " << w << "\n";
     if (config.cli_help_requested)
     {
@@ -806,7 +1008,7 @@ int main(int argc, char **argv)
 
     // Commands that act on the session store and exit, before any of the
     // agent's own setup happens.
-    const int maintenance_status = run_maintenance_command(config);
+    const int maintenance_status = run_maintenance_command(config, style);
     if (maintenance_status >= 0)
         return maintenance_status;
 
@@ -815,7 +1017,8 @@ int main(int argc, char **argv)
     // Which file is this session? (SPEC.md §12.3)
     mkdir_p(config.agent_sessions_dir);
     std::string session_name;
-    if (!resolve_session_file(config, session_name))
+    bool continued_existing_session = false;
+    if (!resolve_session_file(config, style, session_name, continued_existing_session))
         return 1;
 
     size_t slash = config.agent_transcript_log_path.find_last_of('/');
@@ -875,11 +1078,12 @@ int main(int argc, char **argv)
     // declines must leave the transcript byte-identical.
     const std::string work_dir_abs = absolute_or_same(config.agent_work_dir);
 
+    logger.set_console_styles(style.warning, style.error, style.notice);
+
     ControlThread control(&transport, &executor);
     control.start(); // first, before any other thread -- SPEC.md §9.1 / control.h
 
     Agent agent(transport, codec, *protocol, executor, filter, logger, control, config);
-    agent.set_confirm_callback(confirm_prompt);
     if (config.skills_tier2_enabled)
         agent.set_tier2_source(&skills);
 
@@ -895,22 +1099,98 @@ int main(int argc, char **argv)
         known_skill_names.push_back(s.name);
 
     agent.set_on_skills_may_have_changed(
-        [&](std::vector<std::string> &notes) { register_new_skills(config, filter, known_skill_names, notes); });
+        [&](std::vector<std::string> &notes) { register_new_skills(config, style, filter, known_skill_names, notes); });
 
-    Colors colors = resolve_colors(config.agent_color_output);
-    bool show_thinking = false;
-    agent.set_on_assistant_text_chunk(
-        [&](const std::string &chunk) { std::cout << colors.assistant() << chunk << colors.reset() << std::flush; });
-    // SPEC.md §15: the command about to run is bold yellow and prefixed with
-    // "▶"; its output is printed unstyled, since ANSI codes mixed into
-    // arbitrary command output risk breaking it.
-    agent.set_on_action([&](const std::string &command) {
-        std::cout << "\n" << colors.action() << "▶ " << command << colors.reset() << "\n" << std::flush;
+    // Streamed text keeps the style OPEN for the whole channel instead of
+    // wrapping every chunk: a three-character chunk wrapped in its own escape
+    // pair turns a page of reasoning into unreadable noise in any capture, and
+    // makes a background flicker. The style is re-opened whenever the channel
+    // changes (reasoning <-> reply) and closed at the end of the turn.
+    bool show_thinking = config.agent_show_thinking;
+    std::string open_stream_style; // style currently left open on the stream
+
+    // The bottom status bar (SPEC.md §15.1). Only ever enabled for the REPL
+    // below: a oneshot run prints and exits, and reserving a terminal row for
+    // a bar nobody has time to read would only disturb its output.
+    StatusBar status_bar;
+    status_bar.set_style(style);
+    status_bar.set_thinking_shown(show_thinking);
+
+    auto stream_in = [&](const std::string &style, const std::string &chunk) {
+        if (style != open_stream_style)
+        {
+            if (!open_stream_style.empty())
+                std::cout << "\x1b[0m";
+            std::cout << style;
+            open_stream_style = style;
+        }
+        std::cout << chunk << std::flush;
+        if (!chunk.empty())
+            g_at_line_start = (chunk[chunk.size() - 1] == '\n');
+    };
+    auto close_stream_style = [&]() {
+        if (!open_stream_style.empty())
+        {
+            std::cout << "\x1b[0m" << std::flush;
+            open_stream_style.clear();
+        }
+    };
+
+    // A console message must never continue the model's line, nor wear the
+    // model's colour. Both are the same fix: close the open style, then break
+    // the line if the cursor is not already at column 0.
+    logger.set_before_console_write([&]() {
+        close_stream_style();
+        if (!g_at_line_start)
+        {
+            std::cout << "\n" << std::flush;
+            g_at_line_start = true;
+        }
     });
-    agent.set_on_tool_output([&](const std::string &output) { std::cout << output << "\n" << std::flush; });
+
+    agent.set_on_assistant_text_chunk([&](const std::string &chunk) {
+        status_bar.set_status(AgentStatus::ModelReplying);
+        stream_in(style.assistant, chunk);
+    });
     agent.set_on_think_chunk([&](const std::string &chunk) {
+        // Reasoning arriving is the only evidence that this model reasons at
+        // all -- the hook fires whether or not the text is being shown.
+        status_bar.set_thinking_supported(Support::Yes);
+        status_bar.set_status(AgentStatus::ModelReasoning);
         if (show_thinking)
-            std::cout << colors.think() << chunk << colors.reset() << std::flush;
+            stream_in(style.think, chunk);
+    });
+
+    // SPEC.md §15 plus the operator's own colours: the command about to run and
+    // what it printed are the agent ACTING, so they share a background band
+    // that the model's own words never use.
+    // Closing the stream style first keeps the model's colour from bleeding
+    // into a block the AGENT is printing.
+    agent.set_confirm_callback([&](const std::string &reason, const std::string &command) {
+        close_stream_style();
+        std::cout << "\n";
+        status_bar.set_status(AgentStatus::AwaitingApproval);
+        const bool approved = confirm_command(style, reason, command);
+        status_bar.set_status(AgentStatus::WaitingForModel);
+        return approved;
+    });
+
+    agent.set_on_action([&](const std::string &command) {
+        status_bar.set_status(AgentStatus::RunningCommand);
+        close_stream_style();
+        std::cout << "\n";
+        print_styled_block(style.action, style.action_has_background, "▶ " + command);
+        std::cout << std::flush;
+    });
+    agent.set_on_tool_output([&](const std::string &output) {
+        close_stream_style();
+        // The command's own escape sequences are stripped from the screen copy
+        // only: one stray reset inside a styled band would punch a hole in it
+        // from there to the end. The transcript keeps the raw bytes.
+        const std::string shown = style.tool_output_has_background ? strip_escapes(output) : output;
+        print_styled_block(style.tool_output, style.tool_output_has_background, shown);
+        std::cout << std::flush;
+        status_bar.set_status(AgentStatus::WaitingForModel);
     });
 
     Message system_message;
@@ -937,11 +1217,30 @@ int main(int argc, char **argv)
     // it. Abort/control messages ("aborted: ...", "iteration limit
     // reached") are never streamed, so they always need printing here.
     auto print_final_result = [&](const std::string &result) {
+        close_stream_style();
         std::cout << "\n"; // always separate from whatever was streamed live, if anything
-        if (!agent.last_result_was_streamed())
-        {
-            std::cout << colors.assistant() << result << colors.reset() << "\n";
-        }
+        if (agent.last_result_was_streamed())
+            return; // the model's answer was already shown as it arrived
+        // "aborted: ..." is TinyCA explaining why it stopped; painting it with
+        // the model's colour made it read as the model's own words.
+        print_styled_block(agent.last_result_was_control() ? style.error : style.assistant, false, result);
+    };
+
+    // One place for "run a turn and keep the bar truthful". The served model
+    // name is only known after a reply arrives, so it is read back from the
+    // history the agent just appended to rather than guessed at startup.
+    auto run_turn = [&](const std::string &task) {
+        status_bar.set_status(AgentStatus::WaitingForModel);
+        const std::string result = agent.run_task(history, task);
+        const std::string served = last_served_model(history);
+        status_bar.set_model(served);
+        // A completed turn with no reasoning in it is the evidence that this
+        // model does not reason; before that, "?" is the honest answer. A turn
+        // that never reached the server is not evidence of anything.
+        if (!served.empty() && status_bar.info().thinking_supported == Support::Unknown)
+            status_bar.set_thinking_supported(Support::No);
+        status_bar.set_status(AgentStatus::WaitingForInput);
+        return result;
     };
 
     if (config.agent_mode == "oneshot")
@@ -976,25 +1275,43 @@ int main(int argc, char **argv)
         {"/reset", "/skills", "/sessions", "/rename", "/history", "/toggle_show_thinking", "/help", "/quit"},
         skill_names, session_names);
 
-    std::cout << "TinyCA ready. Type a task, or /help for commands.\n";
-    if (!config.cli_task_prompt.empty())
+    // One read of the session's own transcript serves both: the lines it typed
+    // and the options it changed.
+    ResumedSession previous_run;
+    std::string previous_err;
+    if (load_previous_run(config, continued_existing_session, previous_run, previous_err))
     {
-        std::string result = agent.run_task(history, config.cli_task_prompt);
-        print_final_result(result);
+        editor.seed_history(user_tasks_in(previous_run.history));
+        restore_session_options(previous_run, style, show_thinking);
+        status_bar.set_thinking_shown(show_thinking);
     }
+    else
+    {
+        editor.seed_history(user_tasks_in(history));
+        if (!previous_err.empty())
+            std::cerr << "warning: " << previous_err << " -- starting with no stored history or options\n";
+    }
+
+    std::cout << "TinyCA ready. Type a task, or /help for commands.\n";
+    status_bar.enable(config.appearance_status_bar && isatty(STDOUT_FILENO) != 0);
+    status_bar.set_status(AgentStatus::WaitingForInput);
+    if (!config.cli_task_prompt.empty())
+        print_final_result(run_turn(config.cli_task_prompt));
 
     while (true)
     {
         std::string line;
-        if (!editor.read_line(std::string(colors.user_input()) + "> " + colors.reset(), line))
+        if (!editor.read_line(style.user_input + "> " + (style.user_input.empty() ? "" : "\x1b[0m"), line))
             break; // EOF
         std::string trimmed = trim(line);
         if (trimmed.empty())
             continue;
         if (starts_with(trimmed, "/"))
         {
-            if (!handle_slash_command(trimmed, history, system_message, skills, show_thinking, config, session_name,
-                                      logger))
+            const bool keep_going = handle_slash_command(trimmed, history, system_message, skills, show_thinking,
+                                                         config, session_name, logger);
+            status_bar.set_thinking_shown(show_thinking); // /toggle_show_thinking changes it
+            if (!keep_going)
                 break;
             continue;
         }
@@ -1004,10 +1321,10 @@ int main(int argc, char **argv)
             continue;
         }
 
-        std::string result = agent.run_task(history, trimmed);
-        print_final_result(result);
+        print_final_result(run_turn(trimmed));
     }
 
+    status_bar.disable();
     control.stop();
     return 0;
 }

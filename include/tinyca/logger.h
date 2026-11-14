@@ -1,6 +1,7 @@
 // BSD 3-Clause License — see LICENSE at the repository root.
 #pragma once
 
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -42,6 +43,16 @@ class Logger
     // restart.
     void set_path(const std::string &path);
 
+    // Console styling and the hook that runs immediately before a console
+    // message is written. Both exist because console messages share a terminal
+    // with streamed model output: without them a warning inherited whatever
+    // SGR state the stream had left open (it came out green, like the model's
+    // own words) and landed mid-line, right after the token the model had just
+    // produced. The hook lets the host close its open style and break the line
+    // first; the styles make TinyCA's voice its own.
+    void set_console_styles(const std::string &warning, const std::string &error, const std::string &info);
+    void set_before_console_write(std::function<void()> hook);
+
     // Console logging (stderr), gated by `level_` -- messages below the
     // configured level are dropped entirely, not written anywhere.
     void log(LogLevel level, const std::string &message);
@@ -62,6 +73,11 @@ class Logger
     static std::string cutoff_line(const std::string &which_cap);
     void append_line(const std::string &line);            // caller holds mutex_
     void write_cutoff_line(const std::string &which_cap); // caller holds mutex_
+
+    std::string warning_style_;
+    std::string error_style_;
+    std::string info_style_;
+    std::function<void()> before_console_write_;
 
     std::string path_;
     long max_bytes_;         // total file cap

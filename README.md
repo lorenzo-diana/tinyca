@@ -13,12 +13,19 @@ able to run on older boards.
 ```bash
 make            # native build -> build/tinyca  (~seconds on x86, ~1 min on a Jetson)
 make test       # offline test suite -- no network, no LLM required
+make x86_64     # Intel/AMD 64-bit build -> build/x86_64/tinyca
 ```
+
+[docs/BUILD.md](docs/BUILD.md) is the step-by-step version for both
+architectures: which target produces which binary, how to confirm a binary is
+for the machine you meant, building on the Jetson versus cross-compiling, and
+what to start before TinyCA is useful.
 
 Needs nothing beyond `build-essential`/`make` (REQUIREMENTS.md A.1). Two
 header-only dependencies are vendored under `third_party/` (`json.hpp`,
 `httplib.h`) — nothing else, no package manager at runtime. `make
-check-portability` and `make cross` exist for cross-toolchain verification;
+check-portability` and `make cross` exist for cross-toolchain verification, and
+`make x86_64` / `make x86_64-static` build explicitly for Intel/AMD 64-bit;
 [REQUIREMENTS.md](REQUIREMENTS.md) §A.2 explains why a native build on the
 target board is the authoritative artifact rather than a cross-compiled one.
 
@@ -112,6 +119,10 @@ single-step tasks, `on_blocked_command = ask`, and the shipped defaults for
 
 Every document about TinyCA, and what it is for:
 
+- [docs/BUILD.md](docs/BUILD.md) — building and running on ARM (aarch64) and
+  x86-64: the targets, the binaries they produce, native versus cross builds,
+  and starting the server TinyCA talks to. The procedures live here; the
+  package lists stay in REQUIREMENTS.md and the target table in SPEC.md §13.
 - [docs/MANUAL.md](docs/MANUAL.md) — the usage reference: every CLI option,
   every config key with its type and default, sessions, skills, protocols,
   command filtering, the transcript format, exit codes. Start here to *use*

@@ -317,9 +317,11 @@ FilterResult CommandFilter::check(const std::string &command) const
     // "ls && add_skill.sh ..." must prompt just like a bare invocation.
     for (const auto &segment : split_command_segments(command))
     {
-        if (contains_token(confirm_required_, extract_head_token(segment)))
+        const std::string head = extract_head_token(segment);
+        if (contains_token(confirm_required_, head))
         {
             result.needs_confirmation = true;
+            result.confirm_token = head;
             break;
         }
     }

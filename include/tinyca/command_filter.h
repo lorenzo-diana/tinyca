@@ -19,9 +19,11 @@ struct FilterResult
     bool allowed = true;
     std::string offending_token; // set when allowed == false
     // Set when the command is allowed but the operator asked to confirm this
-    // particular program before every run (SPEC.md §8.1) -- used for the
-    // skill that creates other skills, whose effect outlives the command.
+    // particular program before every run (SPEC.md §8.1). `confirm_token` is
+    // the program that triggered it, so the prompt can say WHY it is asking
+    // instead of guessing a reason.
     bool needs_confirmation = false;
+    std::string confirm_token;
     std::string reason; // human-readable, for the tool message / confirm prompt
 };
 

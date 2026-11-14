@@ -106,6 +106,11 @@ json build_chat_response(const json &fixture_entry, int request_index)
     json message;
     message["role"] = "assistant";
     message["content"] = fixture_entry.contains("content") ? fixture_entry["content"] : json(nullptr);
+    // A reasoning model answers with its thinking in a separate field rather
+    // than as <think> tags in content (measured on llama-server + Qwen3), so a
+    // fixture can set it and exercise that path without a GPU.
+    if (fixture_entry.contains("reasoning_content"))
+        message["reasoning_content"] = fixture_entry["reasoning_content"];
     if (fixture_entry.contains("tool_calls"))
         message["tool_calls"] = fixture_entry["tool_calls"];
 

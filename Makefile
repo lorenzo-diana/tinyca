@@ -1,7 +1,15 @@
 # TinyCA — see SPEC.md §13 for the target table this mirrors.
 
 CXX       ?= g++
-CROSS     ?=
+# The aarch64 toolchain prefix. Defaulted rather than left empty: an empty
+# prefix means plain g++, so `make cross` on an x86-64 host without the
+# toolchain installed quietly produced an x86-64 binary in build/cross/ -- a
+# "cross build" that verified nothing. check-arch below is the backstop.
+CROSS     ?= aarch64-linux-gnu-
+# The Intel/AMD 64-bit toolchain prefix. Empty would mean "whatever g++ is",
+# which on the aarch64 board silently produces an aarch64 binary -- the one
+# mistake this target exists to prevent, hence a prefix rather than a flag.
+X86_CROSS ?= x86_64-linux-gnu-
 CXXSTD    := -std=c++11
 WARN      := -Wall -Wextra
 BASEFLAGS := $(CXXSTD) -O2 $(WARN) -pthread
@@ -25,7 +33,7 @@ MOCK_OBJS    := $(patsubst $(MOCK_SRC_DIR)/%.cpp,$(BUILD_DIR)/mockllm_obj/%.o,$(
 
 TEST_DIR  := tests
 
-.PHONY: all mock test check-portability cross cross-static format check-format clean install
+.PHONY: all mock test check-portability cross cross-static x86_64 x86_64-static check-arch format check-format clean install
 
 all: $(BUILD_DIR)/tinyca
 
@@ -67,9 +75,38 @@ check-portability:
 # Tier 3: syntax/codegen check for aarch64 only — never deployed (SPEC.md §13).
 cross:
 	$(MAKE) CXX=$(CROSS)g++ BUILD_DIR=build/cross all
+	@$(MAKE) --no-print-directory check-arch BIN=build/cross/tinyca WANT=AArch64
 
 cross-static:
 	$(MAKE) CXX=$(CROSS)g++ BUILD_DIR=build/cross-static BASEFLAGS="$(BASEFLAGS) -static" all
+	@$(MAKE) --no-print-directory check-arch BIN=build/cross-static/tinyca WANT=AArch64
+
+# Intel/AMD 64-bit build => build/x86_64/tinyca. On an x86-64 host this is the
+# same compilation `all` does, named explicitly; on the aarch64 board it is a
+# genuine cross-build and needs g++-x86-64-linux-gnu installed. Either way the
+# result is checked rather than assumed: a binary of the wrong architecture is
+# a failure that otherwise only shows up on the target machine.
+x86_64:
+	$(MAKE) CXX=$(X86_CROSS)g++ BUILD_DIR=build/x86_64 all
+	@$(MAKE) --no-print-directory check-arch BIN=build/x86_64/tinyca WANT=X86-64
+
+x86_64-static:
+	$(MAKE) CXX=$(X86_CROSS)g++ BUILD_DIR=build/x86_64-static BASEFLAGS="$(BASEFLAGS) -static" all
+	@$(MAKE) --no-print-directory check-arch BIN=build/x86_64-static/tinyca WANT=X86-64
+
+# Reads the ELF header of $(BIN) and fails unless its machine is $(WANT).
+# Skipped with a notice where readelf is unavailable, since a missing tool is
+# not a build error.
+check-arch:
+	@if command -v readelf >/dev/null 2>&1; then \
+		machine=$$(readelf -h $(BIN) | sed -n 's/.*Machine: *//p'); \
+		case "$$machine" in \
+			*$(WANT)*) echo "$(BIN): $$machine";; \
+			*) echo "$(BIN): built for '$$machine', expected $(WANT)"; exit 1;; \
+		esac; \
+	else \
+		echo "readelf not found -- skipping the architecture check for $(BIN)"; \
+	fi
 
 format:
 	clang-format -i $(wildcard $(INC_DIR)/*.h) $(SRCS) $(MOCK_SRCS)

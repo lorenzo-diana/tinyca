@@ -46,6 +46,37 @@ struct Config
     std::string agent_log_level = "info";        // error | warn | info | debug
     std::string agent_mode = "interactive";      // interactive | oneshot
     std::string agent_color_output = "auto";     // auto | always | never
+    // Show the model's reasoning as it streams. Off by default: it is long
+    // (measured 206 of 210 chunks on a thinking model) and it is not the
+    // answer. /toggle_show_thinking flips this at runtime; the key exists so a
+    // oneshot run can start with it on, which the toggle alone cannot do.
+    bool agent_show_thinking = false;
+
+    // [appearance] -- terminal styling, "fg[,bg[,attr]]" per element
+    // (SPEC.md §15). The defaults reproduce the colours TinyCA always used,
+    // plus a background band for the two things that are the agent acting
+    // rather than the model talking: the command it runs with its output, and
+    // a question it is asking.
+    std::string appearance_user_input = "cyan,,bold";
+    std::string appearance_think = "white,,dim";
+    std::string appearance_assistant = "green";
+    std::string appearance_action = "yellow,bright_black,bold";
+    std::string appearance_tool_output = ",bright_black";
+    std::string appearance_confirm = "white,blue,bold";
+    // TinyCA's own voice, which must never be mistaken for the model's: a
+    // warning, an error, and the ordinary notices ("new session: ...").
+    std::string appearance_warning = "yellow,,bold";
+    std::string appearance_error = "red,,bold";
+    std::string appearance_notice = "bright_black";
+    // The bottom status bar: the bar itself, and the two words that report a
+    // state rather than describe one (YES/ON against NO/OFF), which are read
+    // by colour before they are read as text.
+    std::string appearance_status = "0,bright_blue,bold";
+    // Off for terminals that mishandle a scroll region; the bar is also
+    // skipped whenever stdout is not a terminal.
+    bool appearance_status_bar = true;
+    std::string appearance_status_yes = "22,bright_blue,bold";
+    std::string appearance_status_no = "88,bright_blue,bold";
 
     // [tools]
     int tools_bash_timeout_s = 60;

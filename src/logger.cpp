@@ -143,11 +143,34 @@ void Logger::transcript(const std::string &kind, const std::string &payload_json
     append_line(line);
 }
 
+void Logger::set_console_styles(const std::string &warning, const std::string &error, const std::string &info)
+{
+    warning_style_ = warning;
+    error_style_ = error;
+    info_style_ = info;
+}
+
+void Logger::set_before_console_write(std::function<void()> hook)
+{
+    before_console_write_ = std::move(hook);
+}
+
 void Logger::log(LogLevel level, const std::string &message)
 {
     if (static_cast<int>(level) > static_cast<int>(level_))
         return; // below the configured verbosity
-    std::cerr << "[" << level_name(level) << "] " << message << std::endl;
+
+    // Let the host close any style it left open on the stream and put us at the
+    // start of a line. Without it the message continues the model's last line,
+    // in the model's colour -- indistinguishable from what the model said.
+    if (before_console_write_)
+        before_console_write_();
+
+    const std::string &style = (level == LogLevel::Error)  ? error_style_
+                               : (level == LogLevel::Warn) ? warning_style_
+                                                           : info_style_;
+    const char *reset = style.empty() ? "" : "\x1b[0m";
+    std::cerr << style << "[" << level_name(level) << "] " << message << reset << std::endl;
 }
 
 LogLevel Logger::level_from_string(const std::string &s)

@@ -63,6 +63,19 @@ class ThinkStreamSplitter
         process();
     }
 
+    // Emits whatever is still held back, at end of stream. process() keeps a
+    // partial tag in the buffer in case the next chunk completes it; once
+    // there is no next chunk, holding it back would silently drop it.
+    void flush()
+    {
+        if (buffer_.empty())
+            return;
+        const auto &sink = in_think_ ? on_think_ : on_text_;
+        if (sink)
+            sink(buffer_);
+        buffer_.clear();
+    }
+
   private:
     // How much of `s` can be emitted now without risking that a tag got
     // split across two SSE chunks: if `s` ends with any proper prefix of
@@ -126,6 +139,17 @@ class ThinkStreamSplitter
     bool in_think_ = false;
 };
 
+// True when the text opens a ```bash block and never closes it. Used only to
+// decide whether the DISPLAY needs a closing fence appended -- see
+// run_streaming_request.
+bool has_unterminated_fence(const std::string &text)
+{
+    const size_t open_pos = text.rfind("```bash");
+    if (open_pos == std::string::npos)
+        return false;
+    return text.find("```", open_pos + 7) == std::string::npos;
+}
+
 std::string message_to_json(const Message &m)
 {
     json j;
@@ -133,6 +157,11 @@ std::string message_to_json(const Message &m)
     j["content"] = m.content;
     j["reasoning"] = m.reasoning;
     j["tool_call_id"] = m.tool_call_id;
+    j["served_model"] = m.served_model;
+    // Why generation stopped. Without it a transcript cannot distinguish "the
+    // model chose to stop" from "it hit max_tokens", which is the first
+    // question asked of a turn that produced nothing useful.
+    j["finish_reason"] = m.finish_reason;
     json calls = json::array();
     for (const auto &tc : m.tool_calls)
         calls.push_back({{"id", tc.id}, {"name", tc.name}, {"arguments", tc.arguments}});
@@ -164,7 +193,7 @@ Agent::Agent(ITransport &transport, ICodec &codec, IProtocol &protocol, Executor
 {
 }
 
-void Agent::set_confirm_callback(std::function<bool(const std::string &)> cb)
+void Agent::set_confirm_callback(std::function<bool(const std::string &, const std::string &)> cb)
 {
     confirm_callback_ = std::move(cb);
 }
@@ -241,7 +270,8 @@ bool Agent::run_streaming_request(const std::string &request_body, Message &out,
 
     HttpResponse resp =
         transport_.post_stream(config_.llm_api_path, request_body, headers, [&](const std::string &chunk_json) {
-            size_t before = out.content.size();
+            const size_t content_before = out.content.size();
+            const size_t reasoning_before = out.reasoning.size();
             std::string local_err;
             if (!codec_.decode_stream_chunk(chunk_json, out, local_err))
             {
@@ -249,9 +279,31 @@ bool Agent::run_streaming_request(const std::string &request_body, Message &out,
                 decode_err = local_err;
                 return;
             }
-            if (out.content.size() > before)
-                splitter.feed(out.content.substr(before));
+            // Reasoning that arrived in its own field needs no tag parsing --
+            // it is already separated -- so it goes straight to the think
+            // channel. Only `content` passes through the splitter, which is
+            // there for servers that inline <think> tags instead.
+            if (out.reasoning.size() > reasoning_before && on_think_chunk_)
+                on_think_chunk_(out.reasoning.substr(reasoning_before));
+            if (out.content.size() > content_before)
+                splitter.feed(out.content.substr(content_before));
         });
+
+    // The stop sequences for `fenced` are the closing fence itself, and the
+    // server does not return the text it stopped on -- so a turn that ended
+    // with a command displays "```bash" + the command and no closing fence,
+    // which reads as a truncated block. Close it on the DISPLAY only: history,
+    // the transcript and the parser all keep exactly what the model sent.
+    if (on_assistant_text_chunk_ && has_unterminated_fence(out.content))
+        on_assistant_text_chunk_(out.content.empty() || out.content[out.content.size() - 1] == '\n' ? "```\n"
+                                                                                                    : "\n```\n");
+
+    // Whatever the splitter was holding back for a possible tag belongs to the
+    // user now: the stream is over and no further chunk can complete it.
+    // Without this, a reply ending in "<", "<t", "<th"... lost those bytes from
+    // the display while the model had actually sent them (measured: sent
+    // "the answer is 42 <th", screen showed "the answer is 42 ").
+    splitter.flush();
 
     if (decode_failed)
     {
@@ -326,9 +378,9 @@ std::vector<ToolResult> Agent::run_actions(const std::vector<Action> &actions)
             }
             else // "ask"
             {
-                bool user_allows = confirm_callback_ ? confirm_callback_("Command blocked by filter (" + fr.reason +
-                                                                         "): " + action.command + "\nRun anyway?")
-                                                     : false;
+                bool user_allows =
+                    confirm_callback_ ? confirm_callback_("blocked by the command filter: " + fr.reason, action.command)
+                                      : false;
                 proceed = user_allows;
                 if (!proceed)
                     block_message = "blocked: the user did not allow this command to run";
@@ -337,11 +389,13 @@ std::vector<ToolResult> Agent::run_actions(const std::vector<Action> &actions)
         else if (fr.needs_confirmation)
         {
             // The filter allows this program but the operator asked to be
-            // asked every time (SPEC.md §8.1) -- add_skill, whose effect
-            // outlives the command that created it.
-            bool user_allows = confirm_callback_ ? confirm_callback_("About to run: " + action.command +
-                                                                     "\nThis creates or changes a skill. Proceed?")
-                                                 : false;
+            // asked every time (SPEC.md §8.1). The reason names the program
+            // that triggered it: saying "this creates or changes a skill" for
+            // every listed program (python3, sed, ...) was simply false.
+            bool user_allows =
+                confirm_callback_
+                    ? confirm_callback_("'" + fr.confirm_token + "' is in tools.confirm_commands", action.command)
+                    : false;
             proceed = user_allows;
             if (!proceed)
                 block_message = "blocked: the user did not allow this command to run";
@@ -349,7 +403,7 @@ std::vector<ToolResult> Agent::run_actions(const std::vector<Action> &actions)
         else if (config_.tools_confirm_mode == "always")
         {
             bool user_allows =
-                confirm_callback_ ? confirm_callback_("About to run: " + action.command + "\nProceed?") : false;
+                confirm_callback_ ? confirm_callback_("tools.confirm_mode = always", action.command) : false;
             proceed = user_allows;
             if (!proceed)
                 block_message = "blocked: the user did not allow this command to run";
@@ -385,6 +439,7 @@ std::string Agent::run_task(std::vector<Message> &history, const std::string &us
 {
     control_.reset();
     last_result_was_streamed_ = false;
+    last_result_was_control_ = true; // cleared only by a real model answer
     empty_turn_retries_ = 0;
 
     Message user_msg;
@@ -460,8 +515,27 @@ std::string Agent::run_task(std::vector<Message> &history, const std::string &us
             return "aborted: " + transport_err;
         }
 
+        // llm.model_id is a label we send and the server ignores; this is what
+        // actually answered. Reported once per run, so a session pointed at
+        // the wrong endpoint -- or silently re-pointed at other weights --
+        // says so instead of looking identical in the transcript.
+        if (!assistant.served_model.empty() && !served_model_reported_)
+        {
+            served_model_reported_ = true;
+            if (assistant.served_model != config_.llm_model_id)
+                logger_.log(LogLevel::Warn, "the server is serving '" + assistant.served_model +
+                                                "', not llm.model_id '" + config_.llm_model_id +
+                                                "' (llm.model_id is a label; llama-server ignores it)");
+        }
+
         if (config_.protocol_strip_think)
             extract_think(assistant);
+
+        // A non-streamed reply arrives whole, so nothing has reached the think
+        // channel yet. Send it now, or `show_thinking` would be silently
+        // ignored whenever llm.stream = false.
+        if (!options.stream && !assistant.reasoning.empty() && on_think_chunk_)
+            on_think_chunk_(assistant.reasoning + "\n");
         logger_.transcript("response", message_to_json(assistant));
 
         Message history_entry = assistant;
@@ -558,6 +632,7 @@ std::string Agent::run_task(std::vector<Message> &history, const std::string &us
                 continue;
             }
             last_result_was_streamed_ = options.stream;
+            last_result_was_control_ = false;
             return assistant.content;
         }
 

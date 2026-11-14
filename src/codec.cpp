@@ -136,10 +136,18 @@ bool OpenAIChatCodec::decode_response(const std::string &body, Message &out, std
 
     if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty())
     {
+        out.served_model = j.value("model", std::string());
         const json &choice = j["choices"].front();
         json msg = choice.value("message", json::object());
 
         out.role = msg.value("role", std::string("assistant"));
+        // A reasoning model served through --jinja returns its thinking in a
+        // separate field, NOT as <think> tags inside content: measured on
+        // llama-server + Qwen3-4B-Thinking, content was the final answer alone
+        // and reasoning_content held 799 bytes of deliberation. Read it here;
+        // the <think>-in-content path (Agent::extract_think) stays for servers
+        // that inline the tags, which Qwen2.5-Coder does.
+        out.reasoning = msg.value("reasoning_content", std::string());
         out.finish_reason.clear();
         if (choice.contains("finish_reason") && choice["finish_reason"].is_string())
             out.finish_reason = choice["finish_reason"].get<std::string>();
@@ -195,12 +203,21 @@ bool OpenAIChatCodec::decode_stream_chunk(const std::string &chunk_json, Message
 
     if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty())
     {
+        if (accumulator.served_model.empty())
+            accumulator.served_model = j.value("model", std::string());
         const json &choice = j["choices"].front();
         if (choice.contains("delta"))
         {
             const json &delta = choice["delta"];
             if (delta.contains("role") && delta["role"].is_string())
                 accumulator.role = delta["role"].get<std::string>();
+            // Streamed reasoning arrives in its own field, chunk by chunk --
+            // 206 of 210 chunks in the measured run. Accumulated separately so
+            // the caller can show it on the think channel as it arrives
+            // without it ever entering `content`, which is what the protocol
+            // parser and the replayed history see.
+            if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string())
+                accumulator.reasoning += delta["reasoning_content"].get<std::string>();
             if (delta.contains("content") && delta["content"].is_string())
                 accumulator.content += delta["content"].get<std::string>();
             if (delta.contains("tool_calls") && delta["tool_calls"].is_array())

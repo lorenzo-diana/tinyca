@@ -44,6 +44,11 @@ struct Message
     // normalised to "length". "length" means the reply was cut at max_tokens,
     // so anything parsed out of it is a fragment -- see Agent::run_task.
     std::string finish_reason;
+    // The model the SERVER says it used. llm.model_id is only echoed to the
+    // server and ignored by llama-server, so this is the only trustworthy
+    // record of which weights produced a turn -- and the only way to notice
+    // that an endpoint is serving something else entirely.
+    std::string served_model;
 };
 
 } // namespace tinyca

@@ -32,7 +32,12 @@ class Agent
     // Interactive confirmation hook (confirm_mode=always, on_blocked_command=
     // ask). Not required: if never set, every confirmation defaults to
     // "deny" -- the safe choice for headless/oneshot use with no terminal.
-    void set_confirm_callback(std::function<bool(const std::string &prompt)> cb);
+    // Asked before running a command that needs the user's approval. Takes
+    // the REASON it is being asked ("'python3' is in tools.confirm_commands")
+    // and the command itself, separately: the host formats them, so the full
+    // command can be shown as its own block rather than inlined into a
+    // sentence, where a long script is easy to mistake for truncated output.
+    void set_confirm_callback(std::function<bool(const std::string &reason, const std::string &command)> cb);
 
     // Streaming UI hooks (SPEC.md §9.3/§15): called with each new text delta
     // as it arrives. Optional; a CLI not interested in live output can leave
@@ -76,6 +81,15 @@ class Agent
     // the transcript and interactive use is blind.
     void set_on_tool_output(std::function<void(const std::string &)> cb);
 
+    // True when the string run_task() returned is TinyCA's own ("aborted:
+    // ...", "iteration limit reached", "interrupted by user") rather than the
+    // model's answer. The two must not look alike: an abort painted in the
+    // model's colour reads as something the model said.
+    bool last_result_was_control() const
+    {
+        return last_result_was_control_;
+    }
+
     bool last_result_was_streamed() const
     {
         return last_result_was_streamed_;
@@ -96,7 +110,7 @@ class Agent
     ControlThread &control_;
     const Config &config_;
 
-    std::function<bool(const std::string &)> confirm_callback_;
+    std::function<bool(const std::string &, const std::string &)> confirm_callback_;
     std::function<void(const std::string &)> on_assistant_text_chunk_;
     std::function<void(const std::string &)> on_think_chunk_;
     const SkillRegistry *tier2_registry_ = nullptr;
@@ -107,6 +121,8 @@ class Agent
     // Empty-turn retries used in the current task (SPEC.md §9). Reset per
     // run_task, so one bad turn does not poison a whole session.
     int empty_turn_retries_ = 0;
+    bool served_model_reported_ = false;
+    bool last_result_was_control_ = false;
 };
 
 } // namespace tinyca

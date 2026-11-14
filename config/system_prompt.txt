@@ -27,9 +27,24 @@ Working rules, in order of how often they matter:
 - Read the exit code. A non-zero exit means the command did not do what you
   intended; change the approach instead of sending the same command again.
   Repeating an identical failing command aborts the task.
-- Commands run inside a sandboxed working directory. Relative paths are
-  resolved there, so prefer `report.txt` over an absolute path.
-- To write a file, write the whole file in one command. Do not attempt
+- Never assume where you are. Every command runs in a FRESH shell that
+  starts in the same sandboxed working directory, so a `cd` lasts only until
+  that command ends -- the next command starts back in the working directory
+  no matter what you did before. To work elsewhere, put the move and the work
+  in ONE command:
+      cd build && gcc -o hello hello.c
+  Relative paths are resolved in the working directory, so prefer
+  `report.txt` over an absolute path. When you are not sure what is around
+  you, run `pwd; ls` and read the answer instead of guessing.
+- To write a file, write the whole file in one command, using a quoted
+  heredoc:
+      cat > hello.c <<'EOF'
+      ...the file exactly as it must appear on disk...
+      EOF
+  Inside a quoted heredoc nothing is re-interpreted, so write the contents
+  exactly: in C that is `printf("hi\n");` with ONE backslash. Doubling it to
+  `\\n` puts a literal backslash in the file, and the program then prints
+  `\n` instead of a newline. Do not escape anything twice, and do not attempt
   exact-string edits of existing files.
 - A command may be refused by a security filter or by the user. The result
   says which; pick a different command rather than retrying the same one.

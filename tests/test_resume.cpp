@@ -14,6 +14,7 @@ namespace
 using tinyca::describe_prompt_difference;
 using tinyca::load_session;
 using tinyca::ResumedSession;
+using tinyca::resumed_bool_option;
 
 // A transcript in the exact shape Logger writes, including entry kinds that
 // resume must ignore and one deliberately truncated line.
@@ -143,6 +144,69 @@ void test_describe_prompt_difference()
     TINYCA_CHECK(described.find("bytes") != std::string::npos);
 }
 
+// An option changed inside a session (/toggle_show_thinking) is part of how
+// that session was left, like session_rename and work_dir_update -- so it is
+// recorded and read back rather than reverting to the config default on every
+// restart.
+void test_option_changes_are_recovered_and_the_latest_one_wins()
+{
+    const std::string path = "build/tests/resume_options.jsonl";
+    {
+        std::ofstream f(path, std::ios::trunc);
+        f << R"({"ts":1,"kind":"session_start","payload":{"work_dir":"/w"}})" << "\n";
+        f << R"({"ts":2,"kind":"option_change","payload":{"key":"agent.show_thinking","value":"true"}})" << "\n";
+        f << R"({"ts":3,"kind":"user_task","payload":{"text":"hi"}})" << "\n";
+        // Toggled off and on again: the transcript is append-only, so all three
+        // are there and only the last one is the state.
+        f << R"({"ts":4,"kind":"option_change","payload":{"key":"agent.show_thinking","value":"false"}})" << "\n";
+        f << R"({"ts":5,"kind":"option_change","payload":{"key":"agent.show_thinking","value":"true"}})" << "\n";
+    }
+    ResumedSession session;
+    std::string err;
+    TINYCA_CHECK(load_session(path, session, err));
+    TINYCA_CHECK_EQ(session.options.size(), static_cast<size_t>(1));
+
+    // The option entries are state, not conversation: they must not appear as
+    // messages to the model.
+    TINYCA_CHECK_EQ(session.history.size(), static_cast<size_t>(1));
+
+    bool show_thinking = false; // the config default
+    std::string option_err;
+    TINYCA_CHECK(resumed_bool_option(session, "agent.show_thinking", show_thinking, option_err));
+    TINYCA_CHECK(show_thinking);
+    TINYCA_CHECK_EQ(option_err, std::string(""));
+    std::remove(path.c_str());
+}
+
+void test_untouched_and_malformed_options_leave_the_default_alone()
+{
+    const std::string path = "build/tests/resume_options_bad.jsonl";
+    {
+        std::ofstream f(path, std::ios::trunc);
+        f << R"({"ts":1,"kind":"option_change","payload":{"key":"agent.show_thinking","value":"yes please"}})" << "\n";
+        f << R"({"ts":2,"kind":"option_change","payload":{"value":"true"}})" << "\n"; // no key
+    }
+    ResumedSession session;
+    std::string err;
+    TINYCA_CHECK(load_session(path, session, err));
+
+    // A session that never changed the option: the caller's default stands and
+    // the call says so, rather than returning a value the session never set.
+    ResumedSession empty;
+    bool value = true;
+    std::string option_err;
+    TINYCA_CHECK(!resumed_bool_option(empty, "agent.show_thinking", value, option_err));
+    TINYCA_CHECK(value); // untouched
+
+    // A value that is neither true nor false is reported and treated as
+    // absent: a corrupt transcript must not flip a setting silently.
+    value = false;
+    TINYCA_CHECK(!resumed_bool_option(session, "agent.show_thinking", value, option_err));
+    TINYCA_CHECK(!value); // untouched
+    TINYCA_CHECK(option_err.find("yes please") != std::string::npos);
+    std::remove(path.c_str());
+}
+
 void run_all_tests()
 {
     TINYCA_RUN(test_missing_file_is_reported_not_crashed);
@@ -152,6 +216,8 @@ void run_all_tests()
     TINYCA_RUN(test_stored_system_prompt_is_recovered_from_the_first_request);
     TINYCA_RUN(test_transcript_without_a_system_prompt);
     TINYCA_RUN(test_describe_prompt_difference);
+    TINYCA_RUN(test_option_changes_are_recovered_and_the_latest_one_wins);
+    TINYCA_RUN(test_untouched_and_malformed_options_leave_the_default_alone);
 }
 
 } // namespace

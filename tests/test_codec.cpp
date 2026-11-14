@@ -289,6 +289,45 @@ void test_stream_tool_call_index_is_bounded()
     TINYCA_CHECK_EQ(ok_acc.tool_calls.size(), static_cast<size_t>(3));
 }
 
+// A reasoning model served through --jinja returns its thinking in
+// reasoning_content, NOT as <think> tags inside content. Measured on
+// llama-server + Qwen3-4B-Thinking: content was the final answer alone, and
+// 206 of 210 stream chunks carried only reasoning_content. Reading content
+// alone dropped all of it, which is why /toggle_show_thinking had nothing to
+// show.
+void test_reasoning_content_is_decoded()
+{
+    tinyca::OpenAIChatCodec codec;
+    std::string err;
+
+    tinyca::Message blocking;
+    TINYCA_CHECK(codec.decode_response(
+        R"({"choices":[{"message":{"role":"assistant","content":"5","reasoning_content":"2 plus 3 is 5"},)"
+        R"("finish_reason":"stop"}]})",
+        blocking, err));
+    TINYCA_CHECK_EQ(blocking.content, std::string("5"));
+    TINYCA_CHECK_EQ(blocking.reasoning, std::string("2 plus 3 is 5"));
+
+    // Streamed: reasoning arrives in its own deltas, chunk by chunk, and must
+    // accumulate separately from content.
+    tinyca::Message streamed;
+    TINYCA_CHECK(codec.decode_stream_chunk(R"({"choices":[{"delta":{"role":"assistant"}}]})", streamed, err));
+    TINYCA_CHECK(codec.decode_stream_chunk(R"({"choices":[{"delta":{"reasoning_content":"think"}}]})", streamed, err));
+    TINYCA_CHECK(codec.decode_stream_chunk(R"({"choices":[{"delta":{"reasoning_content":"ing..."}}]})", streamed, err));
+    TINYCA_CHECK(codec.decode_stream_chunk(R"({"choices":[{"delta":{"content":"42"}}]})", streamed, err));
+    TINYCA_CHECK_EQ(streamed.reasoning, std::string("thinking..."));
+    TINYCA_CHECK_EQ(streamed.content, std::string("42"));
+
+    // A server that inlines <think> tags instead leaves reasoning empty here;
+    // Agent::extract_think handles that shape, so content is untouched.
+    tinyca::Message inlined;
+    TINYCA_CHECK(codec.decode_response(
+        R"({"choices":[{"message":{"role":"assistant","content":"<think>hm</think>done"},"finish_reason":"stop"}]})",
+        inlined, err));
+    TINYCA_CHECK(inlined.reasoning.empty());
+    TINYCA_CHECK_EQ(inlined.content, std::string("<think>hm</think>done"));
+}
+
 void run_all_tests()
 {
     TINYCA_RUN(test_encode_chat_mode_basic_shape);
@@ -304,6 +343,7 @@ void run_all_tests()
     TINYCA_RUN(test_round_trip_encode_then_decode_canned_response);
     TINYCA_RUN(test_finish_reason_is_decoded);
     TINYCA_RUN(test_stream_tool_call_index_is_bounded);
+    TINYCA_RUN(test_reasoning_content_is_decoded);
 }
 
 } // namespace

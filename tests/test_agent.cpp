@@ -598,18 +598,28 @@ void test_confirm_required_skill_creation_can_be_declined()
     ControlThread control(&transport, &executor);
     control.start();
 
-    std::vector<std::string> prompts;
+    std::vector<std::string> reasons;
+    std::vector<std::string> commands_asked;
     Agent agent(transport, codec, protocol, executor, filter, logger, control, cfg);
-    agent.set_confirm_callback([&](const std::string& message) {
-        prompts.push_back(message);
+    agent.set_confirm_callback([&](const std::string& reason, const std::string& command) {
+        reasons.push_back(reason);
+        commands_asked.push_back(command);
         return false; // the user declines
     });
 
     std::vector<Message> history;
     agent.run_task(history, "make me a skill");
 
-    TINYCA_CHECK_EQ(prompts.size(), static_cast<size_t>(1));
-    TINYCA_CHECK(prompts[0].find("creates or changes a skill") != std::string::npos);
+    TINYCA_CHECK_EQ(reasons.size(), static_cast<size_t>(1));
+    // The reason names the program that triggered the prompt. It used to claim
+    // "this creates or changes a skill" for every confirm_commands entry,
+    // which is false for python3 and friends.
+    TINYCA_CHECK(reasons[0].find("add_skill.sh") != std::string::npos);
+    TINYCA_CHECK(reasons[0].find("tools.confirm_commands") != std::string::npos);
+    // The command is handed over whole and separately, so the host can show
+    // every line of it rather than inlining it into a sentence.
+    TINYCA_CHECK_EQ(commands_asked.size(), static_cast<size_t>(1));
+    TINYCA_CHECK(commands_asked[0].find("add_skill.sh count_files") != std::string::npos);
     TINYCA_CHECK(history[2].content.find("the user did not allow") != std::string::npos);
     // Nothing was written.
     SkillRegistry after;
@@ -682,6 +692,43 @@ void test_two_empty_turns_abort()
     control.stop();
 }
 
+// Item 1: llm.model_id is echoed to the server and ignored by llama-server,
+// so swapping the model behind one endpoint changes everything while the
+// config says otherwise. The server names what it actually served; record it
+// and say so once when it disagrees.
+void test_served_model_is_recorded_and_mismatch_warned()
+{
+    int port = 18216;
+    const std::string log = "build/tests/agent_transcript_" + std::to_string(port) + ".jsonl";
+    std::remove(log.c_str());
+    MockServer mock("tests/fixtures/well_formed_single_action.json",
+                    "build/tests/agent_req_" + std::to_string(port) + ".jsonl", port, 2);
+
+    Config cfg = base_config(port);
+    cfg.llm_model_id = "qwen2.5-coder-1.5b"; // the label we send
+    cfg.agent_transcript_log_path = log;
+    HttpTransport transport(cfg.llm_base_url, 5, 10);
+    OpenAIChatCodec codec;
+    FencedProtocol protocol;
+    Executor executor(cfg.agent_work_dir, cfg.tools_bash_timeout_s, cfg.tools_output_head_lines,
+                      cfg.tools_output_tail_lines, cfg.tools_output_max_bytes);
+    CommandFilter filter(FilterMode::Whitelist, split(cfg.tools_whitelist, ','), {}, false, {});
+    Logger logger(cfg.agent_transcript_log_path, 0, 0, LogLevel::Info);
+    ControlThread control(&transport, &executor);
+    control.start();
+
+    Agent agent(transport, codec, protocol, executor, filter, logger, control, cfg);
+    std::vector<Message> history;
+    agent.run_task(history, "list the files");
+
+    // mockllm reports itself as "mock-model", which is not what the config
+    // claims -- exactly the situation this exists to surface.
+    TINYCA_CHECK_EQ(history[1].served_model, std::string("mock-model"));
+    TINYCA_CHECK(read_whole_file(log).find("\"served_model\":\"mock-model\"") != std::string::npos);
+
+    control.stop();
+}
+
 void run_all_tests()
 {
     TINYCA_RUN(test_full_loop_end_to_end_against_mockllm);
@@ -699,6 +746,7 @@ void run_all_tests()
     TINYCA_RUN(test_confirm_required_skill_creation_can_be_declined);
     TINYCA_RUN(test_empty_turn_is_retried_once_then_reported);
     TINYCA_RUN(test_two_empty_turns_abort);
+    TINYCA_RUN(test_served_model_is_recorded_and_mismatch_warned);
 }
 
 } // namespace

@@ -16,6 +16,10 @@
 #   4. Coverage. Every CLI long option and every configuration key that exists
 #      in the code must appear in the usage reference, which is the single
 #      definition of both.
+#   5. The binary's own --help must list every long option and every
+#      interactive command it actually implements. Help text that omits a
+#      feature is the documentation defect users meet first, and it drifts
+#      silently because nothing links the two.
 #
 # Reachability is transitive. Only relative links are followed; http(s) links
 # and #anchors are ignored.
@@ -147,6 +151,31 @@ else
             FAIL=1
         }
     done < <(grep -oE '\{"[a-z_]+\.[a-z_0-9]+", &Config' src/config.cpp | sed 's/{"//; s/", &Config//' | sort -u)
+fi
+
+# Rule 5: --help against the code it describes.
+if [ -x build/tinyca ]; then
+    HELP_OUT="$(build/tinyca --help 2>/dev/null)"
+
+    while read -r opt; do
+        printf '%s' "$HELP_OUT" | grep -q -- "--$opt" || {
+            echo "FAIL: integration_docs: --$opt exists in the code but --help does not list it"
+            FAIL=1
+        }
+    done < <(grep -oE '\{"[a-z-]+", (no|required)_argument' src/config.cpp | sed 's/{"//; s/", .*//' | sort -u)
+
+    # Interactive commands: whatever main.cpp actually dispatches on.
+    while read -r cmd; do
+        printf '%s' "$HELP_OUT" | grep -q -- "$cmd" || {
+            echo "FAIL: integration_docs: interactive command $cmd is implemented but --help does not list it"
+            FAIL=1
+        }
+        grep -q -- "$cmd" "$MANUAL" || {
+            echo "FAIL: integration_docs: interactive command $cmd is implemented but $MANUAL does not list it"
+            FAIL=1
+        }
+    done < <( { grep -oE 'cmd == "/[a-z_]+"|starts_with\(cmd, "/[a-z_]+"' src/main.cpp | grep -oE '/[a-z_]+';
+                grep -oE 'starts_with\(trimmed, "[a-z_]+:"\)' src/main.cpp | grep -oE '[a-z_]+:'; } | sort -u)
 fi
 
 if [ "$FAIL" -eq 0 ]; then

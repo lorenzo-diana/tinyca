@@ -53,7 +53,7 @@ Precedence for anything that exists in both places: **command line > config file
 | `--resume <name\|file>` | Replay a stored session. A bare name is resolved inside `agent.sessions_dir`; anything else is treated as a path. A target that is neither a stored session nor an existing file is a **fatal** error (exit 1) rather than a silently-created new session. The resumed file also becomes the transcript this run writes to. Given together with `--session`, `--resume` wins and says so. |
 | `--resume-prompt <ask\|update\|quit>` | What to do when the resumed session's system prompt differs from the one generated now. Default: `ask` when stdin is a TTY, `quit` otherwise. |
 | `--resume-work-dir <ask\|continue\|quit>` | What to do when the resumed session recorded a different `work_dir`. Default: `ask` on a TTY, `quit` otherwise. |
-| `--session <name>` | Create or continue a named session; the transcript becomes `<sessions_dir>/<name>.jsonl`. Prints `new session:` or `continuing session:`. |
+| `--session <name>` | Create or continue a named session; the transcript becomes `<sessions_dir>/<name>.jsonl`. Prints `new session:` or `continuing session:`. Continuing **appends to the transcript; it does not replay the conversation** — the model starts with no memory of it. Use `--resume <name>` for that. The earlier lines are still put under the up arrow. |
 | `--list-sessions` | List stored sessions (newest first, with date, task count, entry count, size) and exit. If `--rename-to` is also given, the rename happens instead — see below. |
 | `--rename-to <new>` | With `--session <old>`: rename that stored session and exit. Takes precedence over `--list-sessions` if both are given; list afterwards to see the result. Without `--session` it is a fatal error, since there is nothing to rename. |
 | `--version` | Print the version and exit. |
@@ -89,14 +89,14 @@ the bug.
 |---|---|---|---|
 | `base_url` | string | `http://127.0.0.1:8080` | Scheme, host and port of the inference server. Use an IP literal if the binary was statically linked (no NSS). |
 | `api_path` | string | `/v1/chat/completions` | Rewritten to `/completion` automatically when `protocol.enable_grammar = true`. |
-| `model_id` | string | `qwen2.5-coder-1.5b` | Echoed back to the server; arbitrary unless the server was started with `--alias`. |
+| `model_id` | string | `qwen2.5-coder-1.5b` | **A label, not a selector.** It is sent as the request's `model` field and `llama-server` ignores it — swapping the model behind the same endpoint works and this value has no effect. TinyCA records what the server says it actually served in each `response` entry, and warns once per run when the two disagree. |
 | `api_key` | string | `none` | Sent as `Authorization: Bearer`. The literal `none` (and an empty value) sends no header at all. |
 | `request_timeout_s` | int | `900` | Per request. Generous on purpose: generation runs at ~4–5 tok/s on a Jetson Nano. |
 | `connect_timeout_s` | int | `10` | |
-| `max_tokens` | int | `512` | A reply cut off at this limit is detected (`finish_reason: length`) and **not** executed. |
-| `temperature` | double | `0.2` | |
-| `top_p` | double | `0.9` | |
-| `context_tokens` | int | `4096` | Must match the server's `-c`. Used for budget warnings and the hard abort. |
+| `max_tokens` | int | `512` | A reply cut off at this limit is detected (`finish_reason: length`) and **not** executed. On a *reasoning* model the budget must cover the thinking too, which dwarfs the answer: measured on Qwen3-4B-Thinking, a trivial question produced 8.6 KB of reasoning and no answer at all within 2048. Budget 8192+ for such models. |
+| `temperature` | double | `0.2` | Tuned for Qwen2.5-Coder: low, because this is code. **A reasoning model needs its own sampling.** Measured on Qwen3-4B-Thinking with this system prompt: at `0.2`/`0.9` it reasoned past 8192 tokens twice without ever leaving the thinking phase, so `content` came back empty and TinyCA aborted on two empty turns; at Qwen3's recommended `0.6`/`0.95` the same prompt produced 7659 bytes of reasoning and then a correct fenced command, in 1938 tokens. Keep one config file per model and select with `-c`. |
+| `top_p` | double | `0.9` | See `temperature`. |
+| `context_tokens` | int | `4096` | Must match the server's `-c`; TinyCA cannot discover it. Used for budget warnings and the hard abort. |
 | `stream` | bool | `true` | SSE streaming. Presentation only: chunks are accumulated into one complete message before parsing. |
 
 ### `[protocol]`
@@ -124,7 +124,90 @@ the bug.
 | `transcript_max_bytes_per_run` | long | `0` | Cap on what **one run** appends. `0` = unlimited. Must be ≤ `transcript_max_bytes`; a larger value is clamped down with a warning. A non-zero cap below 256 bytes cannot hold one entry plus the cutoff marker and is warned about. |
 | `log_level` | enum | `info` | `error` \| `warn` \| `info` \| `debug`. Console (stderr) verbosity only; the transcript is unaffected. |
 | `mode` | enum | `interactive` | `interactive` \| `oneshot`. |
+| `show_thinking` | bool | `false` | Restored from the session when one is reopened, which takes precedence over this value — see *Session options*. Show the model's reasoning as it streams. Off by default: on a thinking model the reasoning dwarfs the answer (measured 206 of 210 stream chunks), and it is not the answer. `/toggle_show_thinking` flips it at runtime; set it here to start a `-p` run with it on, which the REPL toggle cannot do. Reasoning is always written to the transcript regardless. |
 | `color_output` | enum | `auto` | `auto` \| `always` \| `never`. `auto` colourises only when stdout is a TTY. |
+
+### `[appearance]`
+
+Terminal styling. Each value is `fg[,bg[,attr]]`; any part may be empty, and an
+empty value means unstyled. Colours are the eight basic names (`black`, `red`,
+`green`, `yellow`, `blue`, `magenta`, `cyan`, `white`), their `bright_` forms,
+or a `0`–`255` index on a 256-colour terminal. Attributes: `bold`, `dim`,
+`underline`. A colour that cannot be parsed is a warning, not an error — the
+element is left unstyled and the run continues. Whether any of it is applied at
+all is `agent.color_output`.
+
+| Key | Default | What it paints |
+|---|---|---|
+| `user_input` | `cyan,,bold` | The REPL prompt, i.e. what you type |
+| `think` | `white,,dim` | The model's reasoning, when `show_thinking` is on |
+| `assistant` | `green` | The model's actual reply |
+| `action` | `yellow,bright_black,bold` | The `▶` line: the command the agent is about to run |
+| `tool_output` | `,bright_black` | What that command printed |
+| `confirm` | `white,blue,bold` | A question the agent is asking you |
+| `warning` | `yellow,,bold` | `[warn] …` lines — TinyCA's voice, never the model's |
+| `error` | `red,,bold` | `[error] …` lines, and why a task stopped (`aborted: …`, `iteration limit reached`, `interrupted by user`) |
+| `notice` | `bright_black` | TinyCA's ordinary chatter: `new session: …`, `resumed 4 message(s) …`, `renamed session …` |
+| `status` | `0,bright_blue,bold` | The status bar pinned to the bottom row — index `0` is black that `bold` cannot brighten |
+| `status_yes` | `22,bright_blue,bold` | The `YES` and `ON` words inside it — a dark green index, since `bold` brightens the named colours |
+| `status_no` | `88,bright_blue,bold` | The `NO` and `OFF` words inside it — a dark red index, for the same reason |
+| `status_bar` | `true` | bool. Draw the status bar at all. Turn it off on a terminal that mishandles a scroll region; it is skipped automatically when stdout is not a TTY or the mode is `oneshot`. |
+
+`action` and `tool_output` share a background on purpose: together they are the
+agent *acting*, as opposed to the model talking, and `confirm` uses a different
+one so a question is never mistaken for output. Backgrounds are applied per
+line and cleared to the end of the line, so a block reads as one band.
+
+`warning`, `error` and `notice` are TinyCA speaking about itself. They always
+start on a fresh line: a console message written while the model was
+mid-sentence used to continue that line **in the model's colour**, so a warning
+was indistinguishable from the model's own words. The style is also closed
+before the message, so nothing inherits it.
+
+### The status bar
+
+In interactive mode the bottom terminal row carries a one-line bar, four fields
+separated by ` | `:
+
+```
+ waiting for LLM answer | Qwen3-4B-Thinking-2507 | Thinking supported: YES | Thinking showed: ON
+```
+
+- **Status** — one of `starting up`, `waiting for user input`,
+  `waiting for LLM answer`, `LLM is reasoning`, `LLM is answering`,
+  `waiting for your approval`, `running bash command`.
+- **Model** — the name the *server* reports for the model it is actually
+  serving, read from the reply rather than from `llm.model_id`, so a mismatch
+  between what you configured and what is loaded is visible. Shows
+  `model unknown` until the first reply arrives.
+- **Thinking supported** — `YES` once reasoning has arrived on the stream, `NO`
+  once a **reply has arrived** carrying none, and `?` until then. It reports
+  what the server actually sent, not what the model is advertised to do, so a
+  turn that never reached the server — a connection error, an interrupt before
+  the first token — leaves it at `?` rather than claiming `NO`.
+- **Thinking showed** — `ON`/`OFF`, tracking `agent.show_thinking` and
+  `/toggle_show_thinking`.
+
+`YES`/`ON` are green and `NO`/`OFF` red (`appearance.status_yes` /
+`status_no`); the rest of the line uses `appearance.status`. The defaults are
+bold text on a light blue band. Change the background in all three keys
+together: a styled word ends with a reset — attributes such as `bold` are not
+cleared by setting a colour, and a leftover `bold` on black renders as grey —
+so each key re-applies its own background after one. The row is reserved
+with a terminal scroll region, so output scrolls above the bar instead of over
+it, and the region is released and the row cleared on exit.
+
+On a terminal too narrow for the full labels — 80 columns is — the two thinking
+fields are shortened to `Think: YES | Show: ON`, which keeps all four facts and
+the colours while leaving the model name readable. Narrower still, the model
+name is shortened (ending in `~`) and then the line is truncated from the
+right: the bar never wraps. Fewer than three rows disables it. The label form
+is chosen from the longest status text, not the current one, so it does not
+flip as the status changes.
+
+When `tool_output` has a background, ANSI escape sequences in the command's own
+output are stripped from the screen copy — one stray reset inside the band
+would punch a hole in it — while the transcript keeps the raw bytes.
 
 ### `[tools]`
 
@@ -344,15 +427,71 @@ programs behind a prompt.
 | `/sessions` | List stored sessions; the current one is marked `*` |
 | `/rename <name>` | Rename the live session |
 | `/history` | Print the current message history |
-| `/toggle_show_thinking` | Show or hide `<think>` content as it streams (off by default) |
+| `/toggle_show_thinking` | Show or hide `<think>` content as it streams (off by default). The new value is recorded in the session and restored when it is reopened |
 | `/help` | Print usage |
 | `/quit` | Exit |
 | `show_skill: <name>` | Print a skill's source and add it to the conversation (needs `tier2_enabled`) |
 
-Line editing is a minimal `termios` raw-mode editor: character echo, backspace,
-and TAB completion against the slash commands, skill names after `show_skill:`,
-and session names after `/rename `. An ambiguous prefix prints the candidates
-once. When stdin is not a TTY it falls back to plain line-buffered input.
+### Line editing
+
+A `termios` raw-mode editor (no readline dependency):
+
+| Key | Effect |
+|---|---|
+| `←` `→` | Move the cursor within the line |
+| `Home`, `fn+←`, `Ctrl+A` | Cursor to the start of the line |
+| `End`, `fn+→`, `Ctrl+E` | Cursor to the end of the line |
+| `↑` `↓` | Walk previously entered lines |
+| `Backspace` | Delete before the cursor |
+| `Delete` | Delete under the cursor |
+| `Ctrl+W` | Delete the word before the cursor (as in bash) |
+| `Ctrl+U` / `Ctrl+K` | Delete to the start / to the end of the line |
+| `Ctrl+D` | EOF on an empty line (same as `/quit`) |
+| `TAB` | Complete slash commands, skill names after `show_skill:`, session names after `/rename ` |
+
+Text is inserted at the cursor, so a typo in the middle of a long task does not
+mean retyping it. Both encodings of Home/End are accepted (`ESC[H`/`ESC[F` and
+`ESC[1~`/`ESC[4~`), because terminals disagree and the numeric forms are what
+`fn+←`/`fn+→` send on a keyboard without those keys. An ambiguous TAB prefix
+prints the candidates once.
+
+History holds the lines entered this run, plus the tasks already recorded in
+the session being continued or resumed — so coming back to a session with
+`--session <name>` or `--resume <name>` leaves its earlier lines under the up
+arrow in both cases, even though only `--resume` replays them into the
+conversation. Only lines typed as tasks are stored: tool output and the system
+prompt are not. Blank lines and an immediate repeat are not stored either.
+
+### Session options
+
+Options changed inside a session are part of that session, not of the run that
+happened to change them: `/toggle_show_thinking` writes an `option_change`
+entry, and reopening the session applies the last recorded value with a notice
+(`restored from this session: show_thinking = on`). Both ways of coming back
+restore it — `--session <name>` and `--resume <name>` — since an option is
+state, not conversation, and `--session` not replaying the *conversation* is a
+separate decision.
+
+Precedence: the value recorded in the session wins over `agent.show_thinking`
+in the config file. The config says how sessions *start*; the transcript says
+how **this** session was left, which is the later and more specific statement
+of intent. The notice is printed only when the restored value differs from what
+the run would otherwise have used, so nothing changes silently. `/toggle_show_thinking`
+flips it again — and records that too.
+
+A value in the transcript that is neither `true` nor `false` is reported as a
+warning and ignored, and an option this build does not recognise is named in a
+notice rather than dropped in silence: both can only come from a transcript
+written by another version or edited by hand.
+
+A recorded task containing a control byte — a newline or an escape sequence,
+which a task given with `-p` can contain and a hand-edited transcript certainly
+can — is **skipped** rather than offered under the arrow keys: recalling a line
+echoes it to the terminal, and an escape sequence would be executed by it. Such
+a task is still replayed into the conversation by `--resume` as normal; only the
+arrow-key history leaves it out. Walking away from a half-typed line and back restores it, so
+`↑` is safe to try mid-typing. When stdin is not a TTY the editor falls back to
+plain line-buffered input.
 
 `Ctrl+C` aborts the current task — including mid-generation and mid-command — and
 returns to the prompt; it does not kill the session. Every thread blocks
@@ -375,13 +514,14 @@ Append-only; never rewritten or rotated.
 | `session_start` | `work_dir` this run used |
 | `user_task` | `text` of the task |
 | `request` | The exact request body sent to the server, including `messages[0]`, the system prompt |
-| `response` | `role`, `content`, `reasoning`, `tool_calls`, `tool_call_id` |
+| `response` | `role`, `content`, `reasoning`, `tool_calls`, `tool_call_id`, `finish_reason`, `served_model` |
 | `tool_result` | `id`, `name`, `ok`, `content`, `command`, `executed` |
 | `skills_changed` | `note` announced to the model after a skill appeared |
 | `tier2_skill` | `name` requested and whether it was `found` |
 | `system_prompt_update` | The prompt a resumed session adopted |
 | `work_dir_update` | `work_dir` adopted and the `previous` one |
 | `session_rename` | `previous` and `current` names |
+| `option_change` | `key` (a config key) and `value`, written when an option is changed at runtime |
 | `transcript_cutoff` | Which byte cap stopped further entries |
 
 ## ENVIRONMENT
@@ -401,6 +541,7 @@ The child environment is built before `fork`, so nothing allocates between
 | Path | Purpose |
 |---|---|
 | `config/tinyca.ini` | The config TinyCA loads by default, committed and ready to run. Point `-c` elsewhere to use another one. |
+| `config/qwen3.ini` | A second config for the Qwen3-4B-Thinking endpoint: its own sampling, token budget and timeout. Config files do **not** layer — one file is read, and anything it omits falls back to the built-in default, not to `tinyca.ini`. |
 | `config/system_prompt.txt` | System prompt; the skills index is appended to it at startup. |
 | `skills/*.sh` | Skills. `skills/.skill_template` is the 0755 template `add_skill.sh` copies. |
 | `grammars/hermes_tool_call.gbnf` | GBNF used when `enable_grammar = true`. |

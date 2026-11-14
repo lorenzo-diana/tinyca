@@ -72,6 +72,15 @@ bool load_session(const std::string &path, ResumedSession &out, std::string &err
             continue;
         }
 
+        if (kind == "option_change")
+        {
+            // Last one wins: a toggle flipped twice in a session ends where it
+            // ended, and the transcript is append-only so both are recorded.
+            if (payload.is_object() && payload.contains("key"))
+                out.options[payload.value("key", std::string())] = payload.value("value", std::string());
+            continue;
+        }
+
         if (kind == "request")
         {
             // Not replayed, but it is where the stored system prompt lives.
@@ -103,6 +112,25 @@ bool load_session(const std::string &path, ResumedSession &out, std::string &err
         out.history.push_back(m);
     }
     return true;
+}
+
+bool resumed_bool_option(const ResumedSession &session, const std::string &key, bool &value, std::string &err)
+{
+    const std::map<std::string, std::string>::const_iterator at = session.options.find(key);
+    if (at == session.options.end())
+        return false;
+    if (at->second == "true")
+    {
+        value = true;
+        return true;
+    }
+    if (at->second == "false")
+    {
+        value = false;
+        return true;
+    }
+    err = "session records " + key + " = '" + at->second + "', which is not true or false";
+    return false;
 }
 
 std::string describe_prompt_difference(const std::string &stored, const std::string &current)

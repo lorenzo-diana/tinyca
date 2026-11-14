@@ -661,6 +661,31 @@ entry lands where the rest of that session's history is.
 A transcript whose requests carry no system message (an older file) is reported
 as such and resumed with the current prompt.
 
+#### Options changed inside a session
+
+An option the operator changes mid-session (`/toggle_show_thinking` is the only
+one today) is recorded as an `option_change` entry carrying the config key and
+its new value, and reopening the session applies the last recorded value. The
+reasoning is the same as for `work_dir_update` and `session_rename`: the
+transcript is the only record TinyCA keeps of a session, and the state the
+session was *left in* belongs in it. Having to redo the toggle on every restart
+is what made it feel like a property of the run rather than of the session.
+
+Two deliberate choices:
+
+- **The session's value beats the config file.** The config says how sessions
+  start; the transcript says how this one was left, which is later and more
+  specific. It is announced on screen whenever it differs from what the run
+  would otherwise have used, so the override is never invisible.
+- **Both ways back restore it** — `--resume <name>` and `--session <name>`.
+  An option is state, not conversation; `--session` declining to replay the
+  *conversation* (§12.3) is a separate decision about context, not about
+  settings.
+
+Entries are state, never replayed as messages. A value that is not `true` or
+`false`, or a key this build does not know, is reported and ignored rather than
+guessed at -- both can only come from another version or a hand-edited file.
+
 ### 12.3 Named sessions
 
 A session **is** its transcript: the file `<sessions_dir>/<name>.jsonl`. There is
@@ -681,7 +706,7 @@ uses, in precedence order:
 | Condition | Session file |
 |---|---|
 | `--resume <name>` | that stored session (a bare name is resolved in `sessions_dir`; anything else is treated as a path, so existing `--resume <file>` invocations keep working) |
-| `--session <name>` | `<sessions_dir>/<name>.jsonl`, created if new — the run says `new session:` or `continuing session:` |
+| `--session <name>` | `<sessions_dir>/<name>.jsonl`, created if new — the run says `new session:` or `continuing session:`. Continuing appends to the transcript without replaying it; the notice says so, because "continuing" alone read as if the model remembered the session |
 | `agent.transcript_log_path` set explicitly in the config or on the CLI | that path, unnamed (back-compatible) |
 | nothing of the above | a new session named `YYYY-MM-DD_hh-mm-ss_<work dir basename>`, e.g. `2026-11-01_17-36-04_workspace` |
 
@@ -700,8 +725,9 @@ listing that predates it would be the one ordering that lies.
 **Renaming.** `/rename <new-name>` renames the session being written right now:
 the file is moved with `rename(2)` (atomic within the directory), the logger is
 pointed at the new path, and the move is recorded *inside the file* as a
-`session_rename` entry — append-only, like `system_prompt_update` and
-`work_dir_update`, so the transcript keeps explaining its own history. The
+`session_rename` entry — append-only, like `system_prompt_update`,
+`work_dir_update` and `option_change`, so the transcript keeps explaining its
+own history. The
 scripted form is `--session <old> --rename-to <new>`, which renames and exits.
 
 A rename is refused, with nothing changed, when the new name is unusable, when
@@ -713,13 +739,23 @@ that rather than guessing one.
 `--list-sessions` prints each stored session newest first with its date, task
 count, entry count and size, then exits.
 
-### 12.1 TAB completion
+### 12.1 Line editing and TAB completion
 
 No new dependency — no GNU readline/libedit (not in REQUIREMENTS.md's approved list,
 and pulling one in just for this is disproportionate). Interactive mode puts stdin
 into raw mode via `termios` (already a POSIX facility this project leans on
-elsewhere, e.g. `tcsetattr`) and implements a minimal line editor: character echo,
-backspace, and TAB-triggered completion against a small fixed set of candidates —
+elsewhere, e.g. `tcsetattr`) and implements the subset of line editing a REPL
+actually needs: insertion at the cursor, left/right, Home/End (both the `ESC[H`/`ESC[F`
+and the `ESC[1~`/`ESC[4~` encodings, since terminals disagree and the numeric forms
+are what `fn`+arrow sends), Backspace and Delete, `Ctrl+W` to kill the word before the
+cursor and `Ctrl+U`/`Ctrl+K` to kill to either end, and up/down through the lines
+already entered — including the tasks already recorded in the session being continued
+or resumed, so returning to a session does not start with an empty history
+(`docs/MANUAL.md` lists the keys). Decoding bytes into keys and applying keys to the
+line are pure, terminal-free pieces (`include/tinyca/line_editor.h`) so they can be
+tested without a pty; raw mode, redraw and completion stay in the CLI.
+
+Completion is TAB-triggered against a small fixed set of candidates —
 the slash commands (§12); after a line starts with `show_skill:`, the discovered
 skill names (§7); and after `/rename `, the stored session names (§12.3) — the
 names already taken are exactly what is useful to see there, since a taken name
@@ -738,11 +774,25 @@ resolving off (§15).
 | `mock` | `build/mockllm` |
 | `test` | Builds and runs `tests/run_tests.sh` — must pass offline |
 | `check-portability` | `-std=c++11 -pedantic-errors -Wall -Wextra -Wpedantic` plus the C++14/17 grep ban list |
-| `cross` | `CROSS=aarch64-linux-gnu-` syntax/codegen check only |
+| `cross` | aarch64 syntax/codegen check only (`CROSS=aarch64-linux-gnu-`), result verified from its ELF header |
 | `cross-static` | Adds `-static`; documented NSS caveat |
+| `x86_64` | Intel/AMD 64-bit build ⇒ `build/x86_64/tinyca`, using `X86_CROSS=x86_64-linux-gnu-` |
+| `x86_64-static` | Same, `-static` ⇒ `build/x86_64-static/tinyca` |
+| `check-arch` | Helper: fails unless `BIN`'s ELF machine is `WANT` (skipped where `readelf` is absent) |
 | `format` | Runs `clang-format -i` (style: `.clang-format`, repo root) over `include/` and `src/` |
 | `check-format` | Same, `--dry-run --Werror` — fails if anything isn't already formatted; wired into `make test` |
 | `clean` / `install` | |
+
+Both cross targets default their prefix and then CHECK the binary. An empty
+prefix means plain `g++`, so `make cross` without the toolchain installed built
+an x86-64 binary into `build/cross/` and reported success -- a cross check that
+verified nothing. `x86_64` names a toolchain PREFIX rather than passing `-m64`, because the
+target exists to be run from either host: on an x86-64 machine it is the
+compilation `all` already does, but on the aarch64 board an empty prefix would
+silently produce an aarch64 binary. The result is verified from its ELF header
+instead of assumed -- an architecture mistake otherwise surfaces only on the
+machine that cannot run it. Override the prefix (`make x86_64 X86_CROSS=`) on a
+host whose native g++ is the right one but carries no prefixed alias.
 
 Base flags: `-std=c++11 -O2 -Wall -Wextra -pthread`. No OpenSSL linkage — there is no
 TLS endpoint and no build configuration that needs one.
@@ -759,30 +809,83 @@ HTTP, needing no new codec.
 
 ## 15. Terminal output and colour
 
-Four things need to be visually distinguishable at a glance in the terminal: what
-the *user* typed, the model's `<think>` reasoning, the model's actual (non-thinking)
-reply, and an action the model is about to take (a bash command, a skill
-invocation) before it runs. Tool/command *output* (stdout/stderr from execution) is
-printed unstyled — it is already visually distinct by context (it follows an
-action line) and dumping ANSI codes through arbitrary command output risks breaking
-it.
+Six things must be distinguishable at a glance, and they fall into two groups:
+what the **model** says, and what the **agent** does on its behalf.
 
-New `[agent]` key: `color_output` = `auto` (default) \| `always` \| `never`. `auto`
-colourizes only when stdout is a TTY (checked once via `isatty(STDOUT_FILENO)`) —
-piping to a file or another process gets plain text, no escape codes to strip later.
-
-| Element | Style | When shown |
+| Element | Group | Shown |
 |---|---|---|
-| User input | bold cyan | Interactive mode, as typed |
-| `<think>` reasoning | dim/grey | Only when `/toggle_show_thinking` is on (default off) |
-| Assistant reply (non-thinking content) | default/green | Every turn with no action, or trailing prose around one |
-| Requested action (command about to run) | bold yellow | Right before `Executor` runs it, prefixed `▶` |
+| User input | you | The REPL prompt |
+| Reasoning | model | Only when `agent.show_thinking` is on (or `/toggle_show_thinking`) |
+| Reply | model | Every turn's non-action text |
+| Command about to run (`▶`) | agent | Before `Executor` runs it |
+| Command output | agent | After it ran |
+| A question awaiting your answer | agent | Command approval, blocked-command prompts |
 
-Exact ANSI SGR codes (`\x1b[1;36m` etc.) are an implementation detail of `logger.h`'s
-terminal-output half, not pinned here — the four-way distinction above is the
-contract; the codes just need to be ones a typical terminal (including the Jetson's
-own, and whatever the user SSHes in from) renders correctly, and must be skipped
-entirely when `color_output` resolves to off.
+The agent's three elements paint a **background band**; the model's never do.
+That is the distinction a reader needs first — "is this the model talking, or
+the harness acting?" — and a background survives being skimmed in a way a
+foreground colour does not. The question uses a different background from the
+command/output pair so an approval prompt is never mistaken for output.
+
+Every element is configurable under `[appearance]` (`docs/MANUAL.md` has the
+syntax and defaults); `agent.color_output` = `auto` (default) | `always` |
+`never` remains the on/off switch, with `auto` resolving by `isatty`.
+
+Three implementation rules, each of which exists because its absence was
+visible on screen:
+
+- **The style is re-applied at the start of every line** of a block, and the
+  line is cleared to its end. A background set once stops at the first newline
+  and paints only the text, so a multi-line block came out as ragged stripes.
+- **Streamed text keeps one style open for the whole channel** rather than
+  wrapping each chunk. Wrapping a three-character chunk in its own escape pair
+  turns a page of reasoning into unreadable noise in any capture, and makes a
+  background flicker. The style is re-opened when the channel changes
+  (reasoning ↔ reply) and closed before the agent prints anything of its own.
+- **Output TinyCA did not produce is stripped of escape sequences** before it
+  is painted into a band: one stray reset inside the band clears it from there
+  to the end of the block. The transcript keeps the raw bytes.
+
+A command awaiting approval is printed from the parsed command, in full, one
+line per line — never summarised, never truncated, and never dependent on what
+the live stream happened to show. The decision is about the whole command, and
+a half-shown script is how you approve something you did not read.
+
+### 15.1 The status bar
+
+Interactive mode reserves the bottom terminal row for a one-line bar:
+`status | model | Thinking supported: YES | Thinking showed: ON`. It exists
+because the three questions it answers were otherwise unanswerable while a slow
+model worked -- is TinyCA waiting on the model, on bash, or on me; which model
+is the server actually serving; and does the silence mean reasoning I am not
+being shown.
+
+Each field reports measured state, never configuration:
+
+- The **model** is the name the server returns with its reply, not
+  `llm.model_id` (which is only what was requested, see §3).
+- **Thinking supported** is `YES` only once reasoning has arrived on the stream
+  and `NO` only once a REPLY HAS ARRIVED carrying none; before that it is `?`.
+  Two things are deliberately not treated as evidence: a model that merely had
+  nothing to think about on one turn, and a turn that never reached the server
+  (a connection error or an interrupt before the first token) -- the latter
+  says nothing about the model, so the bar keeps saying `?`.
+
+The row is reserved with a DECSTBM scroll region, so ordinary output scrolls
+above the bar and can never scroll over it; the region is released and the row
+cleared on exit, since a leaked scroll region outlives the process. The bar is
+skipped when stdout is not a TTY, when `appearance.status_bar = false`, in
+`oneshot` mode, and on a terminal with fewer than three rows. Composition and
+width handling are a pure function of the state (`render_status_bar`), separate
+from the terminal control, so they are testable without a terminal.
+
+Width is handled in three stages, because a bar that wraps pushes the bottom
+row up and leaves a stripe of itself in the output: below the width the full
+labels need, they shorten to `Think:`/`Show:` (all four facts and the colours
+survive, and the model name becomes readable again on an 80-column terminal);
+below that the model name is shortened; below that the line is truncated. Which
+label form is used is decided from the longest status text rather than the
+current one, so it stays put as the status changes.
 
 ## 16. Known capability ceiling
 
