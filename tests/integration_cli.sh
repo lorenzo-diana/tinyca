@@ -59,7 +59,7 @@ check "REPL /help works over piped stdin" "$r1"
 echo "$REPL_OUT" | grep -q "fetch_url:" && r2=0 || r2=1
 check "REPL /skills lists the real fetch_url skill" "$r2"
 
-# --- resume with a changed system prompt (SPEC.md §12.2) ---
+# --- attaching to a session with a changed system prompt (SPEC.md §12.2) ---
 # stdin is not a TTY here, so the default policy is "quit": the binary must
 # exit 1 and leave the transcript byte-identical.
 RESUME_LOG="build/tests/cli_resume.jsonl"
@@ -70,22 +70,22 @@ cat > "$RESUME_LOG" <<'JSONL'
 JSONL
 cp "$RESUME_LOG" "$RESUME_LOG.expected"
 
-RESUME_OUT=$("$BIN" -c "$STREAM_OFF_INI" --resume "$RESUME_LOG" -p "continue" --no-confirm 2>&1 < /dev/null)
+RESUME_OUT=$("$BIN" -c "$STREAM_OFF_INI" --session "$RESUME_LOG" -p "continue" --no-confirm 2>&1 < /dev/null)
 resume_rc=$?
 [ "$resume_rc" -eq 1 ] && q1=0 || q1=1
-check "a changed system prompt aborts an unattended resume (exit 1)" "$q1"
-echo "$RESUME_OUT" | grep -q "resume aborted" && q2=0 || q2=1
-check "the aborted resume explains itself" "$q2"
+check "a changed system prompt aborts an unattended attach (exit 1)" "$q1"
+echo "$RESUME_OUT" | grep -q "aborted: the transcript was not modified" && q2=0 || q2=1
+check "the aborted attach explains itself" "$q2"
 cmp -s "$RESUME_LOG" "$RESUME_LOG.expected" && q3=0 || q3=1
-check "an aborted resume leaves the transcript untouched" "$q3"
+check "an aborted attach leaves the transcript untouched" "$q3"
 
-# With --resume-prompt update it proceeds and records the adoption instead.
-"$BIN" -c "$STREAM_OFF_INI" --resume "$RESUME_LOG" --resume-prompt update -u http://127.0.0.1:1 \
+# With --on-prompt-change update it proceeds and records the adoption instead.
+"$BIN" -c "$STREAM_OFF_INI" --session "$RESUME_LOG" --on-prompt-change update -u http://127.0.0.1:1 \
     -p "continue" --no-confirm > /dev/null 2>&1 < /dev/null
 grep -q "system_prompt_update" "$RESUME_LOG" && u1=0 || u1=1
-check "--resume-prompt update records the adopted prompt in the transcript" "$u1"
+check "--on-prompt-change update records the adopted prompt in the transcript" "$u1"
 
-# --- resume in a different work_dir (SPEC.md §12.2) ---
+# --- attaching to a session recorded in a different work_dir (SPEC.md §12.2) ---
 # The transcript says the session ran in /nonexistent/elsewhere; this run uses
 # ./workspace. Unattended, that must quit without touching the file.
 WD_LOG="build/tests/cli_resume_wd.jsonl"
@@ -96,22 +96,22 @@ cat > "$WD_LOG" <<'JSONL'
 JSONL
 cp "$WD_LOG" "$WD_LOG.expected"
 
-WD_OUT=$("$BIN" -c "$STREAM_OFF_INI" --resume "$WD_LOG" --resume-prompt update -p "continue" --no-confirm 2>&1 < /dev/null)
+WD_OUT=$("$BIN" -c "$STREAM_OFF_INI" --session "$WD_LOG" --on-prompt-change update -p "continue" --no-confirm 2>&1 < /dev/null)
 wd_rc=$?
 [ "$wd_rc" -eq 1 ] && w1=0 || w1=1
-check "a different work_dir aborts an unattended resume (exit 1)" "$w1"
+check "a different work_dir aborts an unattended attach (exit 1)" "$w1"
 echo "$WD_OUT" | grep -q "This session last ran with work_dir" && w2=0 || w2=1
 check "the message names the session's previous work_dir" "$w2"
 cmp -s "$WD_LOG" "$WD_LOG.expected" && w3=0 || w3=1
-check "the aborted work_dir resume leaves the transcript untouched" "$w3"
+check "the aborted work_dir attach leaves the transcript untouched" "$w3"
 
-# With --resume-work-dir continue it proceeds and records the move.
-"$BIN" -c "$STREAM_OFF_INI" --resume "$WD_LOG" --resume-prompt update --resume-work-dir continue \
+# With --on-work-dir-change continue it proceeds and records the move.
+"$BIN" -c "$STREAM_OFF_INI" --session "$WD_LOG" --on-prompt-change update --on-work-dir-change continue \
     -u http://127.0.0.1:1 -p "continue" --no-confirm > /dev/null 2>&1 < /dev/null
 grep -q "work_dir_update" "$WD_LOG" && w4=0 || w4=1
-check "--resume-work-dir continue records the move in the transcript" "$w4"
+check "--on-work-dir-change continue records the move in the transcript" "$w4"
 grep -q "session_start" "$WD_LOG" && w5=0 || w5=1
-check "an accepted resume records the run's work_dir" "$w5"
+check "an accepted attach records the run's work_dir" "$w5"
 
 # --- named sessions and rename (SPEC.md §12.3) ---
 SESS_DIR="build/tests/cli_sessions"
@@ -155,29 +155,63 @@ check "--rename-to refuses a name that is not usable as a filename" "$s6"
 check "--rename-to refuses renaming a session to its own name" "$s7"
 
 # Resuming by bare name resolves inside sessions_dir.
-RESUME_NAME_OUT=$("$BIN" -c "$SESS_INI" --resume cli-renamed --resume-prompt update --resume-work-dir continue \
+RESUME_NAME_OUT=$("$BIN" -c "$SESS_INI" --session cli-renamed --on-prompt-change update --on-work-dir-change continue \
     -p "w" --no-confirm 2>&1 < /dev/null)
-echo "$RESUME_NAME_OUT" | grep -q "resumed .* message" && s8=0 || s8=1
-check "--resume accepts a session name, not just a path" "$s8"
+echo "$RESUME_NAME_OUT" | grep -q "restored .* message" && s8=0 || s8=1
+check "--session accepts a stored name, not just a path" "$s8"
 
-# --- a resume target that does not exist must fail, not invent a session ---
+# --- a --session PATH that does not exist must fail, not invent a session ---
 # Finding 2: this used to start a fresh session logging into a file named after
-# the typo, in the current directory, invisible to --list-sessions.
-TYPO_OUT=$("$BIN" -c "$SESS_INI" --resume definitely-not-a-session -p "x" --no-confirm 2>&1 < /dev/null)
+# the typo, in the current directory, invisible to --list-sessions. An unknown
+# bare NAME is a new session by design; an unknown path is a typo.
+TYPO_OUT=$("$BIN" -c "$SESS_INI" --session logs/typo/not-a-session.jsonl -p "x" --no-confirm 2>&1 < /dev/null)
 typo_rc=$?
 [ "$typo_rc" -eq 1 ] && t1=0 || t1=1
-check "--resume with an unknown name exits 1" "$t1"
-echo "$TYPO_OUT" | grep -q "no stored session or transcript file" && t2=0 || t2=1
-check "--resume with an unknown name says so" "$t2"
-[ ! -e "definitely-not-a-session" ] && t3=0 || t3=1
-check "--resume with an unknown name creates no stray file" "$t3"
+check "--session with an unknown path exits 1" "$t1"
+echo "$TYPO_OUT" | grep -q "nor a readable" && t2=0 || t2=1
+check "--session with an unknown path says so" "$t2"
+[ ! -e "logs/typo/not-a-session.jsonl" ] && t3=0 || t3=1
+check "--session with an unknown path creates no stray file" "$t3"
 
-# Finding 3: --session alongside --resume is ignored, and now says so.
-"$BIN" -c "$SESS_INI" --session cli-renamed -p "v" --no-confirm > /dev/null 2>&1 < /dev/null
-BOTH_OUT=$("$BIN" -c "$SESS_INI" --session some-other-name --resume cli-renamed --resume-prompt update \
-    --resume-work-dir continue -p "w" --no-confirm 2>&1 < /dev/null)
-echo "$BOTH_OUT" | grep -q "warning: --session is ignored when --resume is given" && t4=0 || t4=1
-check "--session with --resume warns that it is ignored" "$t4"
+# --- --no-replay: same transcript, fresh conversation, and NOT a silent move ---
+NR_LOG="build/tests/cli_no_replay.jsonl"
+cat > "$NR_LOG" <<'JSONL'
+{"ts":1,"kind":"session_start","payload":{"work_dir":"/nonexistent/elsewhere"}}
+{"ts":2,"kind":"request","payload":{"messages":[{"role":"system","content":"SYS"},{"role":"user","content":"hello"}]}}
+{"ts":3,"kind":"response","payload":{"content":"hi","role":"assistant"}}
+JSONL
+cp "$NR_LOG" "$NR_LOG.expected"
+
+# A transcript recorded in the directory this run uses: nothing to reconcile,
+# so the replay decision is the only thing left to observe.
+NR_SAME="build/tests/cli_no_replay_same.jsonl"
+printf '{"ts":1,"kind":"session_start","payload":{"work_dir":"%s"}}\n' "$(cd ./workspace 2>/dev/null && pwd)" > "$NR_SAME"
+cat >> "$NR_SAME" <<'JSONL'
+{"ts":2,"kind":"request","payload":{"messages":[{"role":"system","content":"SYS"},{"role":"user","content":"hello"}]}}
+{"ts":3,"kind":"response","payload":{"content":"hi","role":"assistant"}}
+JSONL
+NR_SAME_OUT=$("$BIN" -c "$STREAM_OFF_INI" --session "$NR_SAME" --no-replay -p "x" --no-confirm 2>&1 < /dev/null)
+echo "$NR_SAME_OUT" | grep -q "not replaying" && n0=0 || n0=1
+check "--no-replay says it is not replaying the conversation" "$n0"
+echo "$NR_SAME_OUT" | grep -q "restored .* message" && n0b=1 || n0b=0
+check "--no-replay restores no messages into the context" "$n0b"
+
+NR_OUT=$("$BIN" -c "$STREAM_OFF_INI" --session "$NR_LOG" --no-replay -p "x" --no-confirm 2>&1 < /dev/null)
+nr_rc=$?
+# (b): the work_dir still differs, so the move is still a decision -- which
+# unattended means abort, with the transcript untouched. The old --session door
+# moved the session here silently instead.
+[ "$nr_rc" -eq 1 ] && n2=0 || n2=1
+check "--no-replay still refuses to move a session's work_dir unasked (exit 1)" "$n2"
+cmp -s "$NR_LOG" "$NR_LOG.expected" && n3=0 || n3=1
+check "--no-replay left the transcript byte-identical" "$n3"
+
+# With the policy given, it proceeds AND records the move as its own entry.
+"$BIN" -c "$STREAM_OFF_INI" --session "$NR_LOG" --no-replay --on-work-dir-change continue \
+    -u http://127.0.0.1:1 -p "x" --no-confirm > /dev/null 2>&1 < /dev/null
+n4=$(grep -c '"kind":"work_dir_update"' "$NR_LOG")
+[ "$n4" -ge 1 ] && n4=0 || n4=1
+check "an accepted --no-replay move is recorded as work_dir_update" "$n4"
 
 if [ "$FAIL" -eq 0 ]; then
     echo "PASS: integration_cli"

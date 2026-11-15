@@ -5,12 +5,14 @@
 #include <string>
 #include <vector>
 
+#include "tinyca/appearance.h"
 #include "tinyca/message.h"
 
 namespace tinyca
 {
 
-// Replaying a prior session (`--resume`). The transcript written by Logger is
+// Replaying a stored session (`--session <existing>`). The transcript Logger
+// writes is
 // the only session record TinyCA keeps, so resuming means reading it back:
 // user_task/response/tool_result lines become history, "request" lines are
 // skipped (they are a derived re-encoding of history, not new state).
@@ -48,6 +50,24 @@ struct ResumedSession
 // malformed or truncated lines are skipped, matching the project's
 // "diagnostics are never fatal" convention.
 bool load_session(const std::string &path, ResumedSession &out, std::string &err);
+
+// The replayed conversation, styled for the terminal, so a resumed session
+// starts by showing what it is resuming rather than only counting it. Lives
+// here rather than in the CLI because it is part of what resuming MEANS to the
+// user; it is a pure function of (history, style) so the composition and the
+// colouring are testable without a terminal.
+//
+// Shown: the user's tasks and the model's replies, in order. Not shown:
+//  - the system prompt (index 0), which is instructions, not conversation;
+//  - tool results (role "tool"), which can dwarf the turns that caused them --
+//    the commands themselves stay visible, since they are part of the model's
+//    own text as fenced blocks;
+//  - reasoning, which is not replayed into history at all (SPEC.md §12.2), so
+//    there is nothing to show even when agent.show_thinking is on.
+//
+// Each line carries the style of its speaker: a multi-line reply styled only
+// on its first line reads as output that lost its colour halfway.
+std::string render_restored_conversation(const std::vector<Message> &history, const Appearance &style);
 
 // Reads one boolean option out of a loaded session. Returns false when the
 // session never changed that option, leaving `value` alone, so the caller's

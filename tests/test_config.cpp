@@ -319,9 +319,106 @@ void test_shipped_config_sets_confirm_commands()
     TINYCA_CHECK(untouched.tools_confirm_commands.empty());
 }
 
+// --work-dir, and the two resume policies: new CLI surface, with the one
+// mistake that was silently tolerated before -- a policy given with nothing to
+// apply it to.
+void test_work_dir_flag_overrides_the_config_value()
+{
+    std::vector<std::string> argv_storage = argv_without_config_file();
+    argv_storage.push_back("--work-dir");
+    argv_storage.push_back("/tmp/elsewhere");
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    cfg.agent_work_dir = "./from-the-ini";
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK_EQ(cfg.agent_work_dir, std::string("/tmp/elsewhere"));
+}
+
+void test_resume_policies_default_to_ask_and_are_overridable()
+{
+    // The default is a VALUE, not a function of whether stdin is a terminal:
+    // the same invocation now behaves the same way piped or not.
+    std::vector<std::string> plain = argv_without_config_file();
+    auto argv0 = make_argv(plain);
+    tinyca::Config defaults;
+    tinyca::load_config(static_cast<int>(argv0.size()), argv0.data(), defaults);
+    TINYCA_CHECK_EQ(defaults.agent_on_prompt_change, std::string("ask"));
+    TINYCA_CHECK_EQ(defaults.agent_on_work_dir_change, std::string("ask"));
+    TINYCA_CHECK_EQ(defaults.cli_on_prompt_change, std::string("")); // "not given"
+    TINYCA_CHECK_EQ(defaults.cli_on_work_dir_change, std::string(""));
+
+    std::vector<std::string> argv_storage = argv_without_config_file();
+    argv_storage.push_back("--session");
+    argv_storage.push_back("some-session");
+    argv_storage.push_back("--on-prompt-change");
+    argv_storage.push_back("update");
+    argv_storage.push_back("--on-work-dir-change");
+    argv_storage.push_back("continue");
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK_EQ(cfg.cli_on_prompt_change, std::string("update"));
+    TINYCA_CHECK_EQ(cfg.cli_on_work_dir_change, std::string("continue"));
+    TINYCA_CHECK(!has_warning_containing(result.warnings, "no effect"));
+}
+
+void test_no_replay_without_a_session_is_reported()
+{
+    std::vector<std::string> argv_storage = argv_without_config_file();
+    argv_storage.push_back("--no-replay");
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK(cfg.cli_no_replay); // recorded, but there is nothing to not replay
+    TINYCA_CHECK(has_warning_containing(result.warnings, "--no-replay has no effect without --session"));
+}
+
+void test_a_resume_policy_without_resume_is_reported()
+{
+    std::vector<std::string> argv_storage = argv_without_config_file();
+    argv_storage.push_back("--on-prompt-change");
+    argv_storage.push_back("update");
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    // Accepted and then discarded in silence reads as if the run had honoured
+    // it -- and the flag is easy to reach for when --session was what was meant.
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK(has_warning_containing(result.warnings, "--on-prompt-change has no effect without --session"));
+}
+
+void test_an_invalid_policy_value_names_the_fallback()
+{
+    std::vector<std::string> argv_storage = argv_without_config_file();
+    argv_storage.push_back("--session");
+    argv_storage.push_back("whatever");
+    argv_storage.push_back("--on-work-dir-change");
+    argv_storage.push_back("pippo");
+    auto argv = make_argv(argv_storage);
+    tinyca::Config cfg;
+    auto result = tinyca::load_config(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    TINYCA_CHECK(result.ok);
+    TINYCA_CHECK_EQ(cfg.cli_on_work_dir_change, std::string("")); // rejected, so the config value stands
+    TINYCA_CHECK(has_warning_containing(result.warnings, "ask|continue|quit"));
+    TINYCA_CHECK(has_warning_containing(result.warnings, "agent.on_work_dir_change = ask"));
+}
+
 void run_all_tests()
 {
     TINYCA_RUN(test_missing_file_uses_defaults);
+    TINYCA_RUN(test_work_dir_flag_overrides_the_config_value);
+    TINYCA_RUN(test_resume_policies_default_to_ask_and_are_overridable);
+    TINYCA_RUN(test_a_resume_policy_without_resume_is_reported);
+    TINYCA_RUN(test_no_replay_without_a_session_is_reported);
+    TINYCA_RUN(test_an_invalid_policy_value_names_the_fallback);
     TINYCA_RUN(test_comments_sections_whitespace_trimmed);
     TINYCA_RUN(test_missing_key_keeps_default);
     TINYCA_RUN(test_unknown_key_warns_but_does_not_fail);

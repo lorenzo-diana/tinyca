@@ -50,10 +50,12 @@ Precedence for anything that exists in both places: **command line > config file
 | `--no-confirm` | Sets `tools.confirm_mode = never`. Does **not** clear `tools.confirm_commands` or `skills.skill_checks`' `confirm_on_create`. |
 | `--dry-run` | Parse and report actions, execute nothing. The command filter and executor are skipped entirely, so a dry run never triggers a block or confirmation prompt either. |
 | `-v`, `--verbose` | Sets `agent.log_level = debug`. |
-| `--resume <name\|file>` | Replay a stored session. A bare name is resolved inside `agent.sessions_dir`; anything else is treated as a path. A target that is neither a stored session nor an existing file is a **fatal** error (exit 1) rather than a silently-created new session. The resumed file also becomes the transcript this run writes to. Given together with `--session`, `--resume` wins and says so. |
-| `--resume-prompt <ask\|update\|quit>` | What to do when the resumed session's system prompt differs from the one generated now. Default: `ask` when stdin is a TTY, `quit` otherwise. |
-| `--resume-work-dir <ask\|continue\|quit>` | What to do when the resumed session recorded a different `work_dir`. Default: `ask` on a TTY, `quit` otherwise. |
-| `--session <name>` | Create or continue a named session; the transcript becomes `<sessions_dir>/<name>.jsonl`. Prints `new session:` or `continuing session:`. Continuing **appends to the transcript; it does not replay the conversation** — the model starts with no memory of it. Use `--resume <name>` for that. The earlier lines are still put under the up arrow. |
+
+| `--work-dir <path>` | Override `agent.work_dir` for this run. The directory is created if missing. |
+| `--on-prompt-change <ask\|update\|quit>` | What attaching to an existing session does when its recorded system prompt is not the one generated now. Only consulted when the conversation is replayed. Overrides `agent.on_prompt_change`. **Has no effect without `--session`**, and says so. |
+| `--on-work-dir-change <ask\|continue\|quit>` | Same, when the session recorded a different `work_dir`. Consulted with **and** without `--no-replay`. Overrides `agent.on_work_dir_change`. **Has no effect without `--session`**, and says so. |
+| `--session <name\|file>` | The session this run belongs to — **the only way to pick one**. A bare name is `<sessions_dir>/<name>.jsonl`, created if new; anything else is taken as a transcript path, which must exist (an unknown path is fatal, exit 1, rather than a stray file invisible to `--list-sessions`). An existing session has its conversation **replayed** into the model's context and printed on screen. Prints `new session:` or `continuing session:`. |
+| `--no-replay` | With `--session <existing>`: append to its transcript but start the model with an empty context. The arrow-key history and the session's stored options are still restored, and a `work_dir` difference is still reconciled. Cheap when the context window is small. **Has no effect without `--session`**, and says so. |
 | `--list-sessions` | List stored sessions (newest first, with date, task count, entry count, size) and exit. If `--rename-to` is also given, the rename happens instead — see below. |
 | `--rename-to <new>` | With `--session <old>`: rename that stored session and exit. Takes precedence over `--list-sessions` if both are given; list afterwards to see the result. Without `--session` it is a fatal error, since there is nothing to rename. |
 | `--version` | Print the version and exit. |
@@ -66,7 +68,7 @@ Unrecognised options produce a warning and are ignored; they are not fatal.
 | Code | Meaning |
 |---|---|
 | 0 | Task completed, REPL exited normally, or an informational action (`--help`, `--version`, `--list-sessions`, `--rename-to`) finished. A model failure (iteration cap, repetition abort, empty replies) still exits 0 — the run itself worked; read the final message. |
-| 1 | Fatal startup or request-level problem: an invalid configuration combination, `protocol.enable_grammar = true` with a missing `grammar_file`, `mode = oneshot` with no task, an unusable `--session` name, an unknown `--resume` target, a failed `--rename-to`, or a declined `--resume` reconciliation. |
+| 1 | Fatal startup or request-level problem: an invalid configuration combination, `protocol.enable_grammar = true` with a missing `grammar_file`, `mode = oneshot` with no task, an unusable `--session` name or unknown `--session` path, a failed `--rename-to`, or a declined session reconciliation. |
 
 ## CONFIGURATION FILE
 
@@ -119,13 +121,15 @@ the bug.
 | `repetition_threshold` | int | `2` | Identical consecutive command sets before aborting. Counts occurrences, so `2` aborts on the second identical turn. |
 | `work_dir` | string | `./workspace` | Execution directory, created if absent. Enforced with `chdir` in the child, not by asking the model. |
 | `sessions_dir` | string | `./logs/sessions` | Where named sessions live, one transcript each. |
-| `transcript_log_path` | string | `./logs/transcript.jsonl` | Setting this explicitly opts out of named sessions. `--resume` and `--session` override it. |
+| `transcript_log_path` | string | `./logs/transcript.jsonl` | Setting this explicitly opts out of named sessions. `--session` overrides it. |
 | `transcript_max_bytes` | long | `0` | Cap on the transcript **file** size, counting what earlier runs already wrote. `0` = unlimited. |
 | `transcript_max_bytes_per_run` | long | `0` | Cap on what **one run** appends. `0` = unlimited. Must be ≤ `transcript_max_bytes`; a larger value is clamped down with a warning. A non-zero cap below 256 bytes cannot hold one entry plus the cutoff marker and is warned about. |
 | `log_level` | enum | `info` | `error` \| `warn` \| `info` \| `debug`. Console (stderr) verbosity only; the transcript is unaffected. |
 | `mode` | enum | `interactive` | `interactive` \| `oneshot`. |
 | `show_thinking` | bool | `false` | Restored from the session when one is reopened, which takes precedence over this value — see *Session options*. Show the model's reasoning as it streams. Off by default: on a thinking model the reasoning dwarfs the answer (measured 206 of 210 stream chunks), and it is not the answer. `/toggle_show_thinking` flips it at runtime; set it here to start a `-p` run with it on, which the REPL toggle cannot do. Reasoning is always written to the transcript regardless. |
 | `color_output` | enum | `auto` | `auto` \| `always` \| `never`. `auto` colourises only when stdout is a TTY. |
+| `on_prompt_change` | enum | `ask` | `ask` \| `update` \| `quit`. What attaching to an existing session does when its recorded system prompt is not the current one. `update` adopts it (and re-sends the whole conversation on the next request); `quit` refuses, leaving the transcript untouched. `--on-prompt-change` overrides it. |
+| `on_work_dir_change` | enum | `ask` | `ask` \| `continue` \| `quit`. Same, when the session recorded a different `work_dir`. `continue` runs here and records a `work_dir_update`; `quit` refuses. Applies with `--no-replay` too. `--on-work-dir-change` overrides it. |
 
 ### `[appearance]`
 
@@ -249,10 +253,10 @@ is safe to copy anywhere, including FAT/exFAT media.
 
 Which file a run uses, in precedence order:
 
-1. `--resume <name|file>` — that session.
-2. `--session <name>` — `<sessions_dir>/<name>.jsonl`, created if new.
-3. An explicit `agent.transcript_log_path` — that path, unnamed.
-4. Otherwise a new session named `YYYY-MM-DD_hh-mm-ss_<work dir basename>` in
+1. `--session <name|file>` — that session: `<sessions_dir>/<name>.jsonl` for a
+   bare name, created if new, or the given transcript path, which must exist.
+2. An explicit `agent.transcript_log_path` — that path, unnamed.
+3. Otherwise a new session named `YYYY-MM-DD_hh-mm-ss_<work dir basename>` in
    local time, e.g. `2026-11-01_18-21-01_workspace`. The name is claimed by
    creating the file atomically, so two runs starting in the same second cannot
    share a transcript; a run that dies later in startup leaves that empty
@@ -271,30 +275,46 @@ is moved, the logger follows it, and a `session_rename` entry records the move);
 with nothing changed, when the new name is unusable, already taken, identical to
 the current one, or the source does not exist.
 
-### Resuming
+### Attaching to an existing session
 
-`--resume` replays `user_task`, `response` and `tool_result` entries as history.
-`request` entries are skipped (they are a re-encoding of history), and no stored
-`system` message is ever replayed. Reconciliation is **transactional**: every
-difference is decided before anything is written, so declining at any point
-leaves the transcript byte-identical.
+`--session <existing>` replays its `user_task`, `response` and `tool_result`
+entries as history, and prints the conversation back (see *Restored
+conversations* below). `request` entries are skipped (they are a re-encoding of
+history), and no stored `system` message is ever replayed.
+
+`--no-replay` keeps the transcript but not the context: the same file is
+appended to, the arrow-key history and stored options are still restored, and
+the `work_dir` difference is still reconciled — only the conversation is left
+out. It exists because replaying a long session costs context window and a full
+prompt reprocess, which on a Jetson is minutes.
+
+Reconciliation is **transactional**: every difference is decided before anything
+is written, so declining at any point leaves the transcript byte-identical.
 
 Two things are reconciled:
 
 - **System prompt** — regenerated every startup from `system_prompt_file` plus a
   live scan of `skills_dir`, so it changes when skills change. On a difference,
-  `--resume-prompt` decides. `update` adopts the new prompt, records a
+  `on_prompt_change` decides (`--on-prompt-change` overrides it). `update` adopts the new prompt, records a
   `system_prompt_update` entry and continues; the next request re-sends the whole
   session, which invalidates the server's KV prefix and reprocesses the full
   prompt (minutes on slow hardware).
 - **Work directory** — every run records its absolute `work_dir` in a
-  `session_start` entry. Resuming elsewhere means the replayed history's relative
-  paths now refer to different files, so `--resume-work-dir` decides. `continue`
-  keeps the current directory and records a `work_dir_update` entry naming the
-  previous one.
+  `session_start` entry. Continuing elsewhere means the history's relative paths
+  now refer to different files, *and* the session's own record of where it
+  belongs changes, so `on_work_dir_change` decides (`--on-work-dir-change`
+  overrides it). `continue` keeps the current directory and records a
+  `work_dir_update` entry naming the previous one. This is checked **with
+  `--no-replay` as well**: without that, the no-replay door moved a session's
+  recorded directory with no question and no entry saying so, a move the
+  replaying door would have refused.
 
-A transcript missing either record (an older file) is reported and resumed with
-the current values.
+The system prompt is reconciled only when the conversation is replayed — with
+`--no-replay` the stored prompt is never sent again, so a difference changes
+nothing.
+
+A transcript missing either record (an older file) is reported and continued
+with the current values.
 
 ## SKILLS
 
@@ -456,10 +476,9 @@ mean retyping it. Both encodings of Home/End are accepted (`ESC[H`/`ESC[F` and
 prints the candidates once.
 
 History holds the lines entered this run, plus the tasks already recorded in
-the session being continued or resumed — so coming back to a session with
-`--session <name>` or `--resume <name>` leaves its earlier lines under the up
-arrow in both cases, even though only `--resume` replays them into the
-conversation. Only lines typed as tasks are stored: tool output and the system
+the session being continued — so coming back to a session with
+`--session <name>` leaves its earlier lines under the up arrow, with or without
+`--no-replay`. Only lines typed as tasks are stored: tool output and the system
 prompt are not. Blank lines and an immediate repeat are not stored either.
 
 ### Session options
@@ -468,9 +487,8 @@ Options changed inside a session are part of that session, not of the run that
 happened to change them: `/toggle_show_thinking` writes an `option_change`
 entry, and reopening the session applies the last recorded value with a notice
 (`restored from this session: show_thinking = on`). Both ways of coming back
-restore it — `--session <name>` and `--resume <name>` — since an option is
-state, not conversation, and `--session` not replaying the *conversation* is a
-separate decision.
+restore it, with and without `--no-replay`, since an option is state, not
+conversation.
 
 Precedence: the value recorded in the session wins over `agent.show_thinking`
 in the config file. The config says how sessions *start*; the transcript says
@@ -488,8 +506,8 @@ A recorded task containing a control byte — a newline or an escape sequence,
 which a task given with `-p` can contain and a hand-edited transcript certainly
 can — is **skipped** rather than offered under the arrow keys: recalling a line
 echoes it to the terminal, and an escape sequence would be executed by it. Such
-a task is still replayed into the conversation by `--resume` as normal; only the
-arrow-key history leaves it out. Walking away from a half-typed line and back restores it, so
+a task is still replayed into the conversation as normal; only the arrow-key
+history leaves it out. Walking away from a half-typed line and back restores it, so
 `↑` is safe to try mid-typing. When stdin is not a TTY the editor falls back to
 plain line-buffered input.
 
@@ -573,7 +591,7 @@ Named session, continued the next day:
 
 ```bash
 tinyca --session sort-bug
-tinyca --resume sort-bug
+tinyca --session sort-bug
 ```
 
 Rename a session, then list them:
@@ -593,7 +611,7 @@ Unattended run that must not stop for prompts (clear `confirm_commands` in the
 config first if it lists a program the task needs):
 
 ```bash
-tinyca -p "run the test suite" --no-confirm --resume-prompt quit
+tinyca -p "run the test suite" --no-confirm --on-prompt-change quit
 ```
 
 ## LIMITATIONS

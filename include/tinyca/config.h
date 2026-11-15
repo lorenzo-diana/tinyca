@@ -36,7 +36,19 @@ struct Config
     std::string agent_system_prompt_file = "config/system_prompt.txt";
     int agent_max_iterations = 8;
     int agent_repetition_threshold = 2;
-    std::string agent_work_dir = "./workspace";
+    std::string agent_work_dir = "./workspace"; // --work-dir overrides this
+
+    // What to do when a RESUMED session disagrees with this run (SPEC.md
+    // §12.2): the system prompt it recorded is not the one just generated (a
+    // skill was added, removed or renamed), or the work_dir it recorded is not
+    // the one this run would use. Both default to "ask", and both are only
+    // consulted when there is an actual difference.
+    //
+    // "ask" is safe unattended as well: with no one to answer, the question
+    // reads EOF, which counts as "no" and aborts without touching the
+    // transcript. --on-prompt-change / --on-work-dir-change override these.
+    std::string agent_on_prompt_change = "ask";   // ask | update | quit
+    std::string agent_on_work_dir_change = "ask"; // ask | continue | quit
     std::string agent_transcript_log_path = "./logs/transcript.jsonl";
     // Where named sessions live (SPEC.md §12.3). A session is one file in
     // here, so the directory is the registry.
@@ -132,19 +144,22 @@ struct Config
     bool cli_help_requested = false;                     // --help
     bool cli_version_requested = false;                  // --version
     std::string cli_config_path = "./config/tinyca.ini"; // -c/--config
-    std::string cli_resume_path;                         // --resume <transcript.jsonl>; empty = fresh session
-    // What to do when a resumed session's stored system prompt differs from
-    // the one just generated (SPEC.md §12.2): ask | update | quit. Empty
-    // means "ask when stdin is a TTY, quit otherwise" -- an unattended run
-    // must not silently adopt a different prompt.
-    std::string cli_resume_prompt_policy;
-    // What to do when a resumed session's recorded work_dir is not the one
-    // this run would use (SPEC.md §12.2): ask | continue | quit. Empty means
-    // "ask when stdin is a TTY, quit otherwise" -- continuing in the wrong
-    // directory silently is how a replayed history ends up describing files
-    // that are not there.
-    std::string cli_resume_work_dir_policy;
-    std::string cli_session_name;              // --session <name>; empty = not asked for by name
+    // --on-prompt-change / --on-work-dir-change. Empty means "not given on the
+    // command line", in which case agent.on_prompt_change and
+    // agent.on_work_dir_change decide. Both apply only when attaching to an
+    // EXISTING session, and are reported as having no effect otherwise.
+    std::string cli_on_prompt_change;
+    std::string cli_on_work_dir_change;
+    // --session <name|path>: the session this run belongs to, created if it is
+    // new. A bare name lives in sessions_dir; anything else is taken as a
+    // transcript path. Empty means "no session named", i.e. a fresh one named
+    // after the moment.
+    std::string cli_session_name;
+    // --no-replay: attach to an existing session WITHOUT replaying its
+    // conversation into the model's context -- the same transcript, a fresh
+    // conversation. Cheap on a small context window; the default is to replay,
+    // because a session the user named is one they expect to be remembered.
+    bool cli_no_replay = false;
     bool cli_list_sessions = false;            // --list-sessions
     std::string cli_rename_to;                 // --rename-to <name>, with --session <old>
     bool cli_transcript_path_explicit = false; // agent.transcript_log_path was set by config/CLI

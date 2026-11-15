@@ -95,7 +95,7 @@ std::string read_file_or_empty(const std::string &path, bool &found)
 // guessed, and `\n` is emitted only when it is actually needed.
 bool g_at_line_start = true;
 
-// TinyCA's own informational lines ("new session: ...", "resumed 4 messages").
+// TinyCA's own informational lines ("new session: ...", "restored 4 messages").
 // Not warnings, not the model: their own style, on stderr, so piping the
 // agent's answer somewhere does not carry the chatter with it.
 void notice(const Appearance &style, const std::string &text)
@@ -148,7 +148,7 @@ class LineEditor
     }
 
     // Pre-loads lines the user typed in an earlier run of this session, so
-    // that after --resume the up arrow walks the conversation that was
+    // that after attaching to a session the up arrow walks the conversation that was
     // restored instead of starting empty -- the restored history is on screen
     // and in the model's context, so not having it under the arrow keys was
     // the odd one out.
@@ -376,13 +376,19 @@ void print_help()
                  "      --no-confirm        confirm_mode = never\n"
                  "      --dry-run           parse and print actions, execute nothing\n"
                  "  -v, --verbose           log_level = debug\n"
-                 "      --resume <file>     replay a prior transcript.jsonl as starting history\n"
-                 "      --resume-prompt <p> ask | update | quit -- what to do when a resumed\n"
-                 "                          session's system prompt differs (default: ask on a\n"
-                 "                          TTY, quit otherwise)\n"
-                 "      --resume-work-dir <p>  ask | continue | quit -- same, for a resumed\n"
-                 "                          session recorded in a different work_dir\n"
-                 "      --session <name>    create or continue a named session\n"
+                 "      --work-dir <path>   override agent.work_dir for this run\n"
+                 "      --session <name|file>  the session this run belongs to: a stored name,\n"
+                 "                          or a transcript path. Created if new; its conversation\n"
+                 "                          is replayed when it exists\n"
+                 "      --no-replay         with --session <existing>: append to its transcript\n"
+                 "                          but start the model fresh (cheap on a small context)\n"
+                 "      --on-prompt-change <p>  ask | update | quit -- what attaching to an\n"
+                 "                          existing session does when its system prompt is not\n"
+                 "                          the current one\n"
+                 "                          (default: agent.on_prompt_change, itself ask)\n"
+                 "      --on-work-dir-change <p>  ask | continue | quit -- same, when the\n"
+                 "                          session recorded a different work_dir\n"
+                 "                          (default: agent.on_work_dir_change, itself ask)\n"
                  "      --list-sessions     list stored sessions and exit\n"
                  "      --rename-to <name>  with --session <old>: rename it and exit\n"
                  "      --version, --help\n"
@@ -524,37 +530,45 @@ void register_new_skills(const Config &config, const Appearance &style, CommandF
 // which case nothing was written and the caller must exit.
 //
 // Reconciliation is transactional: every difference is decided BEFORE anything
-// is recorded, so a resume declined at any point leaves the transcript
+// is recorded, so an attach declined at any point leaves the transcript
 // byte-identical.
-bool resume_into(const Config &config, const std::string &system_prompt, const std::string &work_dir_abs,
-                 Logger &logger, std::vector<Message> &history)
+bool attach_to_session(const Config &config, const std::string &system_prompt, const std::string &work_dir_abs,
+                       Logger &logger, std::vector<Message> &history)
 {
+    const bool replay = !config.cli_no_replay;
     ResumedSession session;
-    std::string resume_err;
-    if (!load_session(config.cli_resume_path, session, resume_err))
+    std::string load_err;
+    if (!load_session(config.agent_transcript_log_path, session, load_err))
     {
-        std::cerr << "warning: --resume: " << resume_err << " -- starting a fresh session\n";
+        std::cerr << "warning: --session: " << load_err << " -- starting a fresh session\n";
     }
     else
     {
         // Reconciliation is transactional: every difference is decided
-        // BEFORE anything is written, so a resume the user declines at
+        // BEFORE anything is written, so an attach the user declines at
         // any point leaves the transcript byte-identical. Two things can
         // differ, and both are asked about before either is recorded.
 
         // 1. The system prompt. It is regenerated every startup (skills
-        // are scanned live), so a resumed session may have run with a
+        // are scanned live), so a stored session may have run with a
         // different one. Adopting it silently would change the agent's
         // instructions behind the user's back; ignoring the difference
         // would replay history against a prompt that no longer describes
         // the available skills.
-        const bool prompt_differs = session.found_system_prompt && session.stored_system_prompt != system_prompt;
+        // Only when the conversation is replayed: with --no-replay the stored
+        // prompt is never sent again, so a difference changes nothing.
+        const bool prompt_differs =
+            replay && session.found_system_prompt && session.stored_system_prompt != system_prompt;
         bool adopt_prompt = false;
         if (prompt_differs)
         {
-            std::string policy = config.cli_resume_prompt_policy;
-            if (policy.empty())
-                policy = (isatty(STDIN_FILENO) != 0) ? "ask" : "quit";
+            // CLI first, then the config file, which defaults to "ask".
+            // "ask" needs no isatty special case: with nobody to answer, the
+            // question reads EOF, which counts as "no" and aborts -- the same
+            // outcome the old TTY-dependent default produced, without the
+            // default depending on how the run was invoked.
+            std::string policy =
+                config.cli_on_prompt_change.empty() ? config.agent_on_prompt_change : config.cli_on_prompt_change;
 
             std::cerr << "The system prompt has changed since this session was recorded: "
                       << describe_prompt_difference(session.stored_system_prompt, system_prompt) << "\n";
@@ -568,52 +582,61 @@ bool resume_into(const Config &config, const std::string &system_prompt, const s
             }
             if (policy == "quit")
             {
-                std::cerr << "resume aborted: the transcript was not modified. Re-run with "
-                             "--resume-prompt update to adopt the new prompt.\n";
+                std::cerr << "aborted: the transcript was not modified. Re-run with "
+                             "--on-prompt-change update to adopt the new prompt.\n";
                 return false;
             }
             adopt_prompt = true;
         }
         else if (!session.found_system_prompt)
         {
-            std::cerr << "warning: --resume: the transcript records no system prompt (older format?) -- "
+            std::cerr << "warning: --session: the transcript records no system prompt (older format?) -- "
                          "continuing with the current one\n";
         }
 
-        // 2. The work directory. Resuming elsewhere is sometimes exactly
-        // what you want, but doing it silently means every relative path
-        // in the replayed history ("sort.c", "./sort_test") now refers to
-        // something else.
+        // 2. The work directory. Continuing a session elsewhere is sometimes
+        // exactly what you want, but doing it silently means every relative
+        // path in its history ("sort.c", "./sort_test") now refers to
+        // something else -- and the session's own record of where it belongs
+        // changes with no entry saying so.
+        //
+        // Checked in BOTH modes, unlike the prompt: with --no-replay the
+        // history is not sent to the model, but the transcript is still this
+        // session's record, and moving it is still a move. Skipping the check
+        // there is exactly how the old --session door moved a session that the
+        // replaying door would have refused to move.
         const bool work_dir_differs = session.found_work_dir && session.stored_work_dir != work_dir_abs;
         bool adopt_work_dir = false;
         if (work_dir_differs)
         {
-            std::string wd_policy = config.cli_resume_work_dir_policy;
-            if (wd_policy.empty())
-                wd_policy = (isatty(STDIN_FILENO) != 0) ? "ask" : "quit";
+            std::string wd_policy =
+                config.cli_on_work_dir_change.empty() ? config.agent_on_work_dir_change : config.cli_on_work_dir_change;
 
             std::cerr << "This session last ran with work_dir:\n  " << session.stored_work_dir
                       << "\nbut this run would use:\n  " << work_dir_abs << "\n";
             if (wd_policy == "ask")
             {
-                std::cout << "Continuing here is fine, but file paths in the replayed history refer to the\n"
-                             "old directory. Answering no quits, so you can restart from there or with\n"
-                             "agent.work_dir = "
-                          << session.stored_work_dir << " in your config.\n";
+                std::cout << (replay ? "Continuing here is fine, but file paths in the restored history refer\n"
+                                       "to the old directory. "
+                                     : "Continuing here is fine, but this session's own record says it belongs\n"
+                                       "in the old directory. ")
+                          << "Answering no quits, so you can restart from there\n"
+                             "or with agent.work_dir = "
+                          << session.stored_work_dir << " (or --work-dir).\n";
                 wd_policy =
                     ask_yes_no("Continue in the current directory and update the session?") ? "continue" : "quit";
             }
             if (wd_policy == "quit")
             {
-                std::cerr << "resume aborted: the transcript was not modified. Re-run with "
-                             "--resume-work-dir continue to move the session here.\n";
+                std::cerr << "aborted: the transcript was not modified. Re-run with "
+                             "--on-work-dir-change continue to move the session here.\n";
                 return false;
             }
             adopt_work_dir = true;
         }
         else if (!session.found_work_dir)
         {
-            std::cerr << "warning: --resume: the transcript records no work_dir (older format?) -- "
+            std::cerr << "warning: --session: the transcript records no work_dir (older format?) -- "
                          "continuing with "
                       << work_dir_abs << "\n";
         }
@@ -625,22 +648,33 @@ bool resume_into(const Config &config, const std::string &system_prompt, const s
         if (adopt_prompt)
         {
             logger.transcript("system_prompt_update",
-                              "{\"reason\":\"resumed session adopted the current system prompt\",\"prompt\":" +
+                              "{\"reason\":\"attached session adopted the current system prompt\",\"prompt\":" +
                                   nlohmann::json(system_prompt).dump() + "}");
             std::cerr << "system prompt updated; the next request re-sends the whole session\n";
         }
         if (adopt_work_dir)
         {
             logger.transcript("work_dir_update",
-                              "{\"reason\":\"resumed session moved to the current work directory\",\"work_dir\":" +
+                              "{\"reason\":\"attached session moved to the current work directory\",\"work_dir\":" +
                                   nlohmann::json(work_dir_abs).dump() +
                                   ",\"previous\":" + nlohmann::json(session.stored_work_dir).dump() + "}");
             std::cerr << "work_dir updated to " << work_dir_abs << "\n";
         }
 
+        // (b): with --no-replay the conversation is NOT restored, but the
+        // work_dir decision above still applies and is still recorded. Before
+        // this, the no-replay door moved a session's recorded directory by
+        // simply logging a new session_start, with no question and no
+        // work_dir_update -- a move that the replaying door would have refused.
+        if (!replay)
+        {
+            std::cerr << "not replaying " << session.history.size() << " message(s): the model starts fresh\n";
+            return true;
+        }
         for (const auto &m : session.history)
             history.push_back(m);
-        std::cerr << "resumed " << session.history.size() << " message(s) from " << config.cli_resume_path << "\n";
+        std::cerr << "restored " << session.history.size() << " message(s) from " << config.agent_transcript_log_path
+                  << "\n";
     }
     return true;
 }
@@ -719,62 +753,67 @@ int run_maintenance_command(const Config &config, const Appearance &style)
     return -1;
 }
 
-// Decides which transcript this run writes to, and what the session is called.
-// In precedence order:
-//   --resume <name|path>   the session being resumed
-//   --session <name>       that named session, created if new
+// Decides which transcript this run writes to, what the session is called, and
+// whether it already existed. In precedence order:
+//   --session <name|path>  that session: a bare name lives in sessions_dir,
+//                          anything else is taken as a transcript path.
+//                          Created if new, attached to if it exists.
 //   an explicit agent.transcript_log_path
 //   otherwise              a new session named YYYY-MM-DD_hh-mm-ss_<work dir>
 // Every session therefore has a name, including the ones nobody named.
-// Returns false on an unusable --session name, which is fatal.
+//
+// There is deliberately ONE door. An earlier design had --session pick the log
+// file and --resume replay the conversation, which meant two flags for one
+// question and a --session that silently did not restore what its name
+// promised. Attaching now replays by default; --no-replay is the exception.
+//
+// Returns false on an unusable name or a path that does not exist, both fatal.
 bool resolve_session_file(Config &config, const Appearance &style, std::string &session_name, bool &continued_existing)
 {
     continued_existing = false;
-    if (!config.cli_resume_path.empty())
-    {
-        if (!config.cli_session_name.empty())
-            std::cerr << "warning: --session is ignored when --resume is given; resuming '" << config.cli_resume_path
-                      << "'\n";
-
-        // A bare name resolves inside sessions_dir; anything else is taken as
-        // a path, so existing --resume invocations keep working.
-        if (valid_session_name(config.cli_resume_path) &&
-            session_exists(config.agent_sessions_dir, config.cli_resume_path))
-        {
-            session_name = config.cli_resume_path;
-            config.cli_resume_path = session_path(config.agent_sessions_dir, session_name);
-        }
-        else if (!file_exists(config.cli_resume_path))
-        {
-            // Neither a stored session nor a readable file. Carrying on would
-            // start a fresh session logging to a file named after the typo,
-            // in the current directory, invisible to --list-sessions -- so
-            // this is refused instead.
-            std::cerr << "fatal: --resume: no stored session or transcript file named '" << config.cli_resume_path
-                      << "'. Use --list-sessions to see what is there.\n";
-            return false;
-        }
-        config.agent_transcript_log_path = config.cli_resume_path;
-        return true;
-    }
     if (!config.cli_session_name.empty())
     {
-        if (!valid_session_name(config.cli_session_name))
+        const std::string &asked = config.cli_session_name;
+        const bool is_name = valid_session_name(asked);
+
+        if (is_name && session_exists(config.agent_sessions_dir, asked))
         {
-            std::cerr << "fatal: --session: '" << config.cli_session_name
-                      << "' is not a usable session name (letters, digits, '_', '-', '.' only)\n";
+            session_name = asked;
+            config.agent_transcript_log_path = session_path(config.agent_sessions_dir, session_name);
+            continued_existing = true;
+        }
+        else if (!is_name && file_exists(asked))
+        {
+            // A transcript path rather than a stored name: the session keeps
+            // being written where it already lives, so one file stays the
+            // complete record of it.
+            session_name = asked;
+            config.agent_transcript_log_path = asked;
+            continued_existing = true;
+        }
+        else if (!is_name)
+        {
+            // Not a usable name, and not a readable file either. Carrying on
+            // would start a session logging to a file named after the typo,
+            // invisible to --list-sessions.
+            std::cerr << "fatal: --session: '" << asked
+                      << "' is neither a stored session name (letters, digits, '_', '-', '.' only) nor a readable "
+                         "transcript file. Use --list-sessions to see what is there.\n";
             return false;
         }
-        session_name = config.cli_session_name;
-        const bool existed = session_exists(config.agent_sessions_dir, session_name);
-        continued_existing = existed;
-        config.agent_transcript_log_path = session_path(config.agent_sessions_dir, session_name);
-        // "continuing" means the transcript is appended to, NOT that the
-        // conversation is replayed -- that is --resume (SPEC.md §12.2). Saying
-        // only "continuing" read as if the model remembered the session.
-        notice(style, existed ? "continuing session: " + session_name + " (appending to its transcript; --resume " +
-                                    session_name + " replays it into the conversation)"
-                              : "new session: " + session_name);
+        else
+        {
+            session_name = asked;
+            config.agent_transcript_log_path = session_path(config.agent_sessions_dir, session_name);
+        }
+
+        if (!continued_existing)
+            notice(style, "new session: " + session_name);
+        else if (config.cli_no_replay)
+            notice(style, "continuing session: " + session_name +
+                              " (--no-replay: its transcript is appended to, but the model starts fresh)");
+        else
+            notice(style, "continuing session: " + session_name);
         return true;
     }
     if (!config.cli_transcript_path_explicit)
@@ -853,18 +892,16 @@ std::vector<std::string> user_tasks_in(const std::vector<Message> &messages)
 
 // What an earlier run of this session left behind, read from its transcript:
 // the lines it typed and the options it changed. Loaded for BOTH ways of
-// coming back to a session -- `--resume <name>`, and `--session <name>` on an
-// existing transcript, which deliberately does not replay the conversation but
-// is still the same session.
+// coming back to a session: with its conversation replayed, and with
+// --no-replay, which keeps the transcript but starts the model fresh. The lines
+// were typed into this session either way.
 //
 // Returns false when there is nothing to read: a brand-new session, or an
 // unreadable transcript (reported in `err`, never fatal).
 bool load_previous_run(const Config &config, bool continued_existing_session, ResumedSession &out, std::string &err)
 {
-    if (config.cli_resume_path.empty() && !continued_existing_session)
+    if (!continued_existing_session)
         return false;
-    // Both paths point agent_transcript_log_path at the session's own file
-    // (resolve_session_file), so one load covers them.
     return load_session(config.agent_transcript_log_path, out, err);
 }
 
@@ -1200,14 +1237,29 @@ int main(int argc, char **argv)
     std::vector<Message> history;
     history.push_back(system_message);
 
-    if (!config.cli_resume_path.empty() && !resume_into(config, system_prompt, work_dir_abs, logger, history))
+    if (continued_existing_session)
     {
-        control.stop();
-        return 1;
+        if (!attach_to_session(config, system_prompt, work_dir_abs, logger, history))
+        {
+            control.stop();
+            return 1;
+        }
+        // Show what was restored, not just how many messages it was. A count
+        // tells the user nothing about whether this is the session they meant,
+        // and the conversation is already in the model's context -- it may as
+        // well be in the user's.
+        const std::string replay = render_restored_conversation(history, style);
+        if (!replay.empty())
+        {
+            notice(style, "--- restored conversation ---");
+            std::cout << replay << std::flush;
+            g_at_line_start = true; // the replay always ends on a newline
+            notice(style, "--- end of restored conversation; continuing it below ---");
+        }
     }
 
-    // Recorded every run, so a later --resume can tell whether it is being
-    // resumed in the same place. Written here rather than at startup because
+    // Recorded every run, so a later --session can tell whether it is being
+    // continued in the same place. Written here rather than at startup because
     // everything above can still decide to abort, and an aborted resume must
     // not touch the file.
     logger.transcript("session_start", "{\"work_dir\":" + nlohmann::json(work_dir_abs).dump() + "}");

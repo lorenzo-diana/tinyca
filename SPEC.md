@@ -92,7 +92,7 @@ and is literal text: an INI value cannot express a newline, so the `fenced` defa
 (§9). `work_dir` is the execution jail, enforced by `chdir` in the child rather than by
 asking the model to behave. The transcript keys are diagnostics, not features: on the
 target board the transcript is the only post-mortem available, which is why there are
-two independent caps (§9.2) and why `--resume` reads this file back (§12.2).
+two independent caps (§9.2) and why `--session` reads this file back (§12.2).
 `sessions_dir` makes the filesystem the session registry (§12.3).
 
 ### 4.4 `[tools]` — what a command may do
@@ -611,12 +611,25 @@ source is on disk and asking the model to fetch it would be slower and less reli
 Ctrl+C works at any point, including mid-generation or mid-command (§9.1) — it aborts
 the current task, not the session.
 
-### 12.2 Resuming a session, and the system prompt
+### 12.2 Continuing a session, and the system prompt
 
-`--resume <transcript.jsonl>` replays a recorded session's `user_task`,
-`response` and `tool_result` entries as the starting history. `request` entries
-are skipped — they are a derived re-encoding of history — and no stored
-`system` message is ever replayed as history.
+`--session <name|file>` is the only way to pick a session, and attaching to one
+that exists replays its `user_task`, `response` and `tool_result` entries as the
+starting history. `request` entries are skipped — they are a derived re-encoding
+of history — and no stored `system` message is ever replayed as history.
+
+**One door, deliberately.** An earlier design split this in two: `--session`
+chose the log file and `--resume` replayed the conversation. That made the
+common question ("continue this piece of work") answerable two ways with
+different meanings, and left a `--session` that restored neither the
+conversation nor the stated working directory while its name promised a
+session. It also let `--session` move a session's recorded `work_dir` silently,
+a move `--resume` would have refused — the same hazard reached through the
+other door. Attaching now replays by default; `--no-replay` is the explicit
+exception, for when the cost of replaying (context window, and a full prompt
+reprocess that takes minutes on a Jetson) is not worth paying. `--no-replay`
+still restores the arrow-key history and the session's options, and still
+reconciles the working directory.
 
 The system prompt is regenerated at every startup from `system_prompt_file`
 plus a live scan of `skills_dir` (§7), so it can legitimately differ from the
@@ -629,7 +642,8 @@ anything is written, so a resume declined at any point leaves the transcript
 byte-identical. Two things can differ — the system prompt and the work
 directory — and both are asked about before either is recorded.
 
-If the prompts differ, `--resume-prompt` decides:
+If the prompts differ, `agent.on_prompt_change` decides, overridable per run
+with `--on-prompt-change`:
 
 | Value | Behaviour |
 |---|---|
@@ -642,7 +656,7 @@ If the prompts differ, `--resume-prompt` decides:
 same place. Resuming elsewhere is sometimes intended, but silently is bad: every
 relative path in the replayed history (`sort.c`, `./sort_test`) now refers to
 something else. When they differ TinyCA prints both directories and
-`--resume-work-dir` decides:
+`agent.on_work_dir_change` decides, overridable with `--on-work-dir-change`:
 
 | Value | Behaviour |
 |---|---|
@@ -653,10 +667,10 @@ something else. When they differ TinyCA prints both directories and
 A transcript with no `session_start` entry (written before this existed) is
 reported as such and resumed in the current directory.
 
-A resumed session continues **in the transcript it was resumed from**:
-`--resume <file>` also sets `agent.transcript_log_path` to that file, so one
-file stays the complete record of the session, and the `system_prompt_update`
-entry lands where the rest of that session's history is.
+A session continues **in its own transcript**: `--session` points
+`agent.transcript_log_path` at that file, so one file stays the complete record
+of the session, and the `system_prompt_update` entry lands where the rest of
+that session's history is.
 
 A transcript whose requests carry no system message (an older file) is reported
 as such and resumed with the current prompt.
@@ -677,10 +691,9 @@ Two deliberate choices:
   start; the transcript says how this one was left, which is later and more
   specific. It is announced on screen whenever it differs from what the run
   would otherwise have used, so the override is never invisible.
-- **Both ways back restore it** — `--resume <name>` and `--session <name>`.
-  An option is state, not conversation; `--session` declining to replay the
-  *conversation* (§12.3) is a separate decision about context, not about
-  settings.
+- **`--no-replay` restores it too.** An option is state, not conversation;
+  declining to replay the *conversation* is a separate decision about context,
+  not about settings.
 
 Entries are state, never replayed as messages. A value that is not `true` or
 `false`, or a key this build does not know, is reported and ignored rather than
@@ -705,8 +718,8 @@ uses, in precedence order:
 
 | Condition | Session file |
 |---|---|
-| `--resume <name>` | that stored session (a bare name is resolved in `sessions_dir`; anything else is treated as a path, so existing `--resume <file>` invocations keep working) |
-| `--session <name>` | `<sessions_dir>/<name>.jsonl`, created if new — the run says `new session:` or `continuing session:`. Continuing appends to the transcript without replaying it; the notice says so, because "continuing" alone read as if the model remembered the session |
+| `--session <name>` | `<sessions_dir>/<name>.jsonl`, created if new — the run says `new session:` or `continuing session:`. An existing one is replayed into the conversation unless `--no-replay` is given |
+| `--session <path>` | that transcript, which must exist: an unknown path is fatal rather than a stray file nobody can list |
 | `agent.transcript_log_path` set explicitly in the config or on the CLI | that path, unnamed (back-compatible) |
 | nothing of the above | a new session named `YYYY-MM-DD_hh-mm-ss_<work dir basename>`, e.g. `2026-11-01_17-36-04_workspace` |
 

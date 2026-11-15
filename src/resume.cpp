@@ -133,6 +133,54 @@ bool resumed_bool_option(const ResumedSession &session, const std::string &key, 
     return false;
 }
 
+std::string render_restored_conversation(const std::vector<Message> &history, const Appearance &style)
+{
+    std::string out;
+    for (size_t i = 0; i < history.size(); ++i)
+    {
+        const Message &m = history[i];
+        std::string speaker_style;
+        std::string prefix;
+        if (m.role == "user")
+        {
+            // The same "> " the live prompt uses, so a replayed task looks
+            // like what it looked like when it was typed.
+            speaker_style = style.user_input;
+            prefix = "> ";
+        }
+        else if (m.role == "assistant")
+        {
+            speaker_style = style.assistant;
+        }
+        else
+        {
+            continue; // system prompt, tool results: see the header
+        }
+        if (m.content.empty())
+            continue;
+
+        // A stored reply usually ends with its own newline. Splitting on it
+        // as-is appends an empty line, which with a style applied is a visible
+        // blank coloured row after every turn.
+        std::string text = m.content;
+        if (!text.empty() && text[text.size() - 1] == '\n')
+            text.erase(text.size() - 1);
+
+        const std::string reset = speaker_style.empty() ? "" : "\x1b[0m";
+        size_t start = 0;
+        while (start <= text.size())
+        {
+            const size_t end = text.find('\n', start);
+            const std::string line = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            out += speaker_style + prefix + line + reset + "\n";
+            if (end == std::string::npos)
+                break;
+            start = end + 1;
+        }
+    }
+    return out;
+}
+
 std::string describe_prompt_difference(const std::string &stored, const std::string &current)
 {
     if (stored == current)

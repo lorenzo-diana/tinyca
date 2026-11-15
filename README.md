@@ -57,7 +57,7 @@ llama-server -m qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
 ./build/tinyca                                          # interactive REPL
 ./build/tinyca --session sort-bug                       # named session
 ./build/tinyca --list-sessions                          # what is stored
-./build/tinyca --resume sort-bug                        # continue it later
+./build/tinyca --session sort-bug                       # continue it later: replayed
 ./build/tinyca --session sort-bug --rename-to fixed     # rename it
 ```
 
@@ -65,15 +65,20 @@ Every session is a transcript under `agent.sessions_dir`; one that nobody names
 gets `YYYY-MM-DD_hh-mm-ss_<work dir>` (SPEC.md §12.3).
 
 CLI flags (`-c/--config`, `-p/--prompt`, `-m/--model`, `-u/--url`, `--protocol`,
-`--no-confirm`, `--dry-run`, `-v/--verbose`, `--resume`, `--resume-prompt`,
+`--no-confirm`, `--dry-run`, `-v/--verbose`, `--work-dir`, `--no-replay`,
+`--session`, `--on-prompt-change`, `--on-work-dir-change`,
 `--version`, `--help`) are listed by `--help` and specified in SPEC.md §12. A
-bare positional task runs it once and then stays interactive. `--resume
-<transcript.jsonl>` replays a previous session. If the system prompt has changed
-since (a skill was added, say) or the session last ran in a different
-`work_dir`, TinyCA names the difference and asks before continuing rather than
-silently changing the agent's instructions or resolving the history's relative
-paths somewhere else; declining leaves the transcript untouched
-(`--resume-prompt`, `--resume-work-dir`, SPEC.md §12.2). Interactive mode supports `/reset`,
+bare positional task runs it once and then stays interactive. `--session
+<name|file>` is the single way to pick a session: new ones are created, existing
+ones have their conversation replayed into the model and printed back, and
+`--no-replay` keeps the transcript while starting the model fresh. If the system
+prompt has changed since (a skill was added, say) or the session last ran in a
+different `work_dir`, TinyCA names the difference and asks before continuing
+rather than silently changing the agent's instructions or resolving the
+history's relative paths somewhere else; declining leaves the transcript
+untouched
+(`agent.on_prompt_change` / `agent.on_work_dir_change`, or the matching
+`--on-*-change` flags, SPEC.md §12.2). Interactive mode supports `/reset`,
 `/skills`, `/sessions`, `/rename <name>`, `/history`, `/toggle_show_thinking`,
 `/help`, `/quit`, and TAB completion for all of the above plus
 `show_skill:<name>` and session names after `/rename`.

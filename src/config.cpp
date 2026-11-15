@@ -139,6 +139,8 @@ const EnumRow kEnumKeys[] = {
     {"agent.log_level", &Config::agent_log_level, "error,warn,info,debug"},
     {"agent.mode", &Config::agent_mode, "interactive,oneshot"},
     {"agent.color_output", &Config::agent_color_output, "auto,always,never"},
+    {"agent.on_prompt_change", &Config::agent_on_prompt_change, "ask,update,quit"},
+    {"agent.on_work_dir_change", &Config::agent_on_work_dir_change, "ask,continue,quit"},
     {"tools.command_filter_mode", &Config::tools_command_filter_mode, "whitelist,blacklist,none"},
     {"tools.on_blocked_command", &Config::tools_on_blocked_command, "ask,deny"},
     {"tools.confirm_mode", &Config::tools_confirm_mode, "always,never"},
@@ -271,12 +273,13 @@ struct CliOverrides
     bool has_verbose = false;
     bool has_help = false;
     bool has_version = false;
-    bool has_resume = false;
-    std::string resume_path;
-    bool has_resume_prompt = false;
-    std::string resume_prompt;
-    bool has_resume_work_dir = false;
-    std::string resume_work_dir;
+    bool no_replay = false;
+    bool has_on_prompt_change = false;
+    std::string on_prompt_change;
+    bool has_on_work_dir_change = false;
+    std::string on_work_dir_change;
+    bool has_work_dir = false;
+    std::string work_dir;
     bool has_session = false;
     std::string session;
     bool has_list_sessions = false;
@@ -293,34 +296,37 @@ enum
     OPT_DRY_RUN = 1003,
     OPT_VERSION = 1004,
     OPT_HELP = 1005,
-    OPT_RESUME = 1006,
-    OPT_RESUME_PROMPT = 1007,
-    OPT_RESUME_WORK_DIR = 1008,
+    OPT_NO_REPLAY = 1006,
+    OPT_ON_PROMPT_CHANGE = 1007,
+    OPT_ON_WORK_DIR_CHANGE = 1008,
     OPT_SESSION = 1009,
     OPT_LIST_SESSIONS = 1010,
-    OPT_RENAME_TO = 1011
+    OPT_RENAME_TO = 1011,
+    OPT_WORK_DIR = 1012
 };
 
 CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings)
 {
     CliOverrides o;
-    static const struct option long_opts[] = {{"config", required_argument, nullptr, 'c'},
-                                              {"prompt", required_argument, nullptr, 'p'},
-                                              {"model", required_argument, nullptr, 'm'},
-                                              {"url", required_argument, nullptr, 'u'},
-                                              {"protocol", required_argument, nullptr, OPT_PROTOCOL},
-                                              {"no-confirm", no_argument, nullptr, OPT_NO_CONFIRM},
-                                              {"dry-run", no_argument, nullptr, OPT_DRY_RUN},
-                                              {"verbose", no_argument, nullptr, 'v'},
-                                              {"version", no_argument, nullptr, OPT_VERSION},
-                                              {"help", no_argument, nullptr, OPT_HELP},
-                                              {"resume", required_argument, nullptr, OPT_RESUME},
-                                              {"resume-prompt", required_argument, nullptr, OPT_RESUME_PROMPT},
-                                              {"resume-work-dir", required_argument, nullptr, OPT_RESUME_WORK_DIR},
-                                              {"session", required_argument, nullptr, OPT_SESSION},
-                                              {"list-sessions", no_argument, nullptr, OPT_LIST_SESSIONS},
-                                              {"rename-to", required_argument, nullptr, OPT_RENAME_TO},
-                                              {nullptr, 0, nullptr, 0}};
+    static const struct option long_opts[] = {
+        {"config", required_argument, nullptr, 'c'},
+        {"prompt", required_argument, nullptr, 'p'},
+        {"model", required_argument, nullptr, 'm'},
+        {"url", required_argument, nullptr, 'u'},
+        {"protocol", required_argument, nullptr, OPT_PROTOCOL},
+        {"no-confirm", no_argument, nullptr, OPT_NO_CONFIRM},
+        {"dry-run", no_argument, nullptr, OPT_DRY_RUN},
+        {"verbose", no_argument, nullptr, 'v'},
+        {"version", no_argument, nullptr, OPT_VERSION},
+        {"help", no_argument, nullptr, OPT_HELP},
+        {"no-replay", no_argument, nullptr, OPT_NO_REPLAY},
+        {"on-prompt-change", required_argument, nullptr, OPT_ON_PROMPT_CHANGE},
+        {"on-work-dir-change", required_argument, nullptr, OPT_ON_WORK_DIR_CHANGE},
+        {"work-dir", required_argument, nullptr, OPT_WORK_DIR},
+        {"session", required_argument, nullptr, OPT_SESSION},
+        {"list-sessions", no_argument, nullptr, OPT_LIST_SESSIONS},
+        {"rename-to", required_argument, nullptr, OPT_RENAME_TO},
+        {nullptr, 0, nullptr, 0}};
 
     optind = 1; // reset getopt's global state -- load_config may be called repeatedly in tests
     opterr = 0;
@@ -364,17 +370,20 @@ CliOverrides parse_cli(int argc, char **argv, std::vector<std::string> &warnings
         case OPT_HELP:
             o.has_help = true;
             break;
-        case OPT_RESUME:
-            o.has_resume = true;
-            o.resume_path = optarg;
+        case OPT_NO_REPLAY:
+            o.no_replay = true;
             break;
-        case OPT_RESUME_PROMPT:
-            o.has_resume_prompt = true;
-            o.resume_prompt = optarg;
+        case OPT_ON_PROMPT_CHANGE:
+            o.has_on_prompt_change = true;
+            o.on_prompt_change = optarg;
             break;
-        case OPT_RESUME_WORK_DIR:
-            o.has_resume_work_dir = true;
-            o.resume_work_dir = optarg;
+        case OPT_ON_WORK_DIR_CHANGE:
+            o.has_on_work_dir_change = true;
+            o.on_work_dir_change = optarg;
+            break;
+        case OPT_WORK_DIR:
+            o.has_work_dir = true;
+            o.work_dir = optarg;
             break;
         case OPT_SESSION:
             o.has_session = true;
@@ -490,30 +499,38 @@ ConfigLoadResult load_config(int argc, char **argv, Config &out)
     out.cli_list_sessions = cli.has_list_sessions;
     if (cli.has_rename_to)
         out.cli_rename_to = cli.rename_to;
-    if (cli.has_resume)
+    out.cli_no_replay = cli.no_replay;
+    if (cli.has_work_dir)
+        out.agent_work_dir = cli.work_dir;
+    if (cli.has_on_work_dir_change)
     {
-        out.cli_resume_path = cli.resume_path;
-        // A resumed session continues IN ITS OWN log: the transcript being
-        // replayed becomes the transcript being written, so one file remains
-        // the complete record of that session (SPEC.md §12.2). CLI beats the
-        // config file here, same as every other override.
-        out.agent_transcript_log_path = cli.resume_path;
-    }
-    if (cli.has_resume_work_dir)
-    {
-        if (is_one_of(cli.resume_work_dir, {"ask", "continue", "quit"}))
-            out.cli_resume_work_dir_policy = cli.resume_work_dir;
+        if (is_one_of(cli.on_work_dir_change, {"ask", "continue", "quit"}))
+            out.cli_on_work_dir_change = cli.on_work_dir_change;
         else
-            result.warnings.push_back("--resume-work-dir: invalid value '" + cli.resume_work_dir +
-                                      "' (ask|continue|quit); falling back to the default");
+            result.warnings.push_back(
+                "--on-work-dir-change: invalid value '" + cli.on_work_dir_change +
+                "' (ask|continue|quit); falling back to agent.on_work_dir_change = " + out.agent_on_work_dir_change);
     }
-    if (cli.has_resume_prompt)
+    if (cli.has_on_prompt_change)
     {
-        if (is_one_of(cli.resume_prompt, {"ask", "update", "quit"}))
-            out.cli_resume_prompt_policy = cli.resume_prompt;
+        if (is_one_of(cli.on_prompt_change, {"ask", "update", "quit"}))
+            out.cli_on_prompt_change = cli.on_prompt_change;
         else
-            result.warnings.push_back("--resume-prompt: invalid value '" + cli.resume_prompt +
-                                      "' (ask|update|quit); falling back to the default");
+            result.warnings.push_back(
+                "--on-prompt-change: invalid value '" + cli.on_prompt_change +
+                "' (ask|update|quit); falling back to agent.on_prompt_change = " + out.agent_on_prompt_change);
+    }
+    // Both policies, and --no-replay, only mean anything when attaching to an
+    // EXISTING session. Accepted and then silently discarded reads as if the
+    // run had honoured them.
+    if (out.cli_session_name.empty())
+    {
+        if (cli.has_on_prompt_change)
+            result.warnings.push_back("--on-prompt-change has no effect without --session; ignoring it");
+        if (cli.has_on_work_dir_change)
+            result.warnings.push_back("--on-work-dir-change has no effect without --session; ignoring it");
+        if (cli.no_replay)
+            result.warnings.push_back("--no-replay has no effect without --session; ignoring it");
     }
 
     // skills.skill_checks is a set, not an enum, so it is validated here

@@ -854,3 +854,74 @@ itself — a single shared "seen" map meant the second tree walk skipped
 documents the first had already found, so a `dev/` document linking into the
 project tree passed. Independent walks per tree; all four violations now fail
 as they should.
+
+## 2026-11-15 — sessions: one door in (--resume removed)
+
+Found by using it. The operator asked what `--session` was actually for, having
+noticed that it looked like `/rename` for a new name and like `--resume` for an
+existing one. It was neither, and the answer was worse than the question.
+
+**The design that was there.** `--session <name>` chose which transcript to
+write; `--resume <name|path>` replayed the conversation into the model. Two
+flags for one question — "continue this piece of work" — of which only one
+continued anything. The flag named after the concept restored neither the
+conversation nor the recorded working directory. Measured on the same session
+file:
+
+```
+--session proj  (2nd run):  request = [system, user]
+--resume  proj  (3rd run):  request = [system, user, assistant, user, assistant, user]
+```
+
+**The defect that made it urgent.** Every run appends a `session_start` entry
+with the work_dir it used, so attaching through the `--session` door quietly
+redefined where a session belonged — no question, no `work_dir_update`, and a
+later `--resume` then found nothing to reconcile:
+
+```
+session_start work_dir = …/dirA     ← original run
+session_start work_dir = …/dirB     ← one --session run with an edited ini
+work_dir_update entries: 0          ← no record that anything moved
+```
+
+That is the same hazard `--resume`'s reconciliation exists to prevent, reached
+through the other door. It also explains an earlier confusion report: trying
+`--session` first and `--resume` second left the second with nothing to say.
+
+**What it is now.** `--session <name|file>` is the only way to pick a session.
+An existing one is attached to and replayed; a new name is created; a *path*
+that does not exist is fatal, rather than a stray file invisible to
+`--list-sessions` (an unknown bare name is a new session by design, so the typo
+guard moved from names to paths). `--no-replay` is the explicit cheap door:
+same transcript, empty context, for when replaying is not worth a context
+window and a full prompt reprocess — minutes on the Jetson. It still restores
+the arrow-key history and the session's stored options, and the work_dir
+reconciliation now runs in **both** modes. The system prompt is reconciled only
+when the conversation is replayed, since otherwise the stored prompt is never
+sent again.
+
+**Names and defaults.** `--resume-prompt` / `--resume-work-dir` became
+`--on-prompt-change` / `--on-work-dir-change` — the old names read as "the
+prompt to resume with", which is exactly how the operator read them, pasting a
+transcript path into `--resume-prompt` and getting a new session. Each now has
+a config key (`agent.on_prompt_change`, `agent.on_work_dir_change`) defaulting
+to `ask`, replacing a default that branched on `isatty`: the same command
+behaved differently piped. `ask` stays safe unattended because the question
+reads EOF, which counts as "no" and aborts — the same outcome as the old
+`quit`, without the invisible branch. Given without `--session`, all three
+flags now say they have no effect instead of being accepted and discarded.
+
+**Also in this session**, from the same "use it and see" loop: the restored
+conversation is printed back in the live colours (a count told nobody whether
+this was the session they meant); `--work-dir` overrides `agent.work_dir` for
+one run; `--session`'s silent work_dir move is gone; and two system-prompt rules
+earned by watching a real model fail — every command runs in a fresh shell
+starting in the work_dir, so a `cd` does not carry over, and files are written
+with a quoted heredoc without double-escaping (a model emitted
+`printf("hello world!\\n")`, which a quoted heredoc leaves as a literal
+backslash; TinyCA was proven byte-faithful first, both by reading the decode
+path and by feeding a mock server known bytes).
+
+Earlier entries in this journal describe the `--resume` design as it stood at
+the time. They are left as written: this file records what was done when, not
+what is true now — `docs/MANUAL.md` and SPEC §12.2 are the current reference.

@@ -14,6 +14,7 @@ namespace
 using tinyca::describe_prompt_difference;
 using tinyca::load_session;
 using tinyca::ResumedSession;
+using tinyca::render_restored_conversation;
 using tinyca::resumed_bool_option;
 
 // A transcript in the exact shape Logger writes, including entry kinds that
@@ -207,6 +208,102 @@ void test_untouched_and_malformed_options_leave_the_default_alone()
     std::remove(path.c_str());
 }
 
+// What a resumed session shows the user. The rendering is a pure function so
+// that what is shown -- and what is deliberately NOT shown -- can be asserted
+// without a terminal.
+void test_restored_conversation_shows_the_turns_in_their_own_colours()
+{
+    tinyca::Appearance style;
+    style.enabled = true;
+    style.user_input = "<U>";
+    style.assistant = "<A>";
+
+    std::vector<tinyca::Message> history;
+    tinyca::Message system;
+    system.role = "system";
+    system.content = "You are TinyCA.";
+    history.push_back(system);
+    tinyca::Message task;
+    task.role = "user";
+    task.content = "count the files";
+    history.push_back(task);
+    tinyca::Message reply;
+    reply.role = "assistant";
+    reply.content = "```bash\nls | wc -l\n```";
+    history.push_back(reply);
+    tinyca::Message tool;
+    tool.role = "tool";
+    tool.content = "Output of `ls | wc -l`:\n4\n[exit code: 0]";
+    history.push_back(tool);
+    tinyca::Message answer;
+    answer.role = "assistant";
+    answer.content = "There are 4 files.";
+    history.push_back(answer);
+
+    const std::string shown = render_restored_conversation(history, style);
+
+    // The user's task, with the live prompt's "> " so it reads as it did when
+    // it was typed, in the user colour.
+    TINYCA_CHECK(shown.find("<U>> count the files\x1b[0m\n") != std::string::npos);
+    // The model's turns, in the assistant colour.
+    TINYCA_CHECK(shown.find("<A>There are 4 files.\x1b[0m\n") != std::string::npos);
+    // The command stays visible: it is part of the model's own text.
+    TINYCA_CHECK(shown.find("ls | wc -l") != std::string::npos);
+
+    // Not shown: the system prompt, and tool output (which can dwarf the turns
+    // that caused it).
+    TINYCA_CHECK(shown.find("You are TinyCA.") == std::string::npos);
+    TINYCA_CHECK(shown.find("[exit code: 0]") == std::string::npos);
+
+    // Every line of a multi-line turn carries the style, not just the first:
+    // the fence, the command and the closing fence are three lines.
+    TINYCA_CHECK(shown.find("<A>```bash\x1b[0m\n<A>ls | wc -l\x1b[0m\n<A>```\x1b[0m\n") != std::string::npos);
+
+    // A stored reply ends with its own newline; splitting on it as-is appended
+    // an empty line, which with a style applied was a blank coloured row after
+    // every turn.
+    tinyca::Message trailing;
+    trailing.role = "assistant";
+    trailing.content = "done.\n";
+    std::vector<tinyca::Message> one;
+    one.push_back(trailing);
+    TINYCA_CHECK_EQ(render_restored_conversation(one, style), std::string("<A>done.\x1b[0m\n"));
+
+    // Blank lines INSIDE a turn are the author's and are kept.
+    tinyca::Message spaced;
+    spaced.role = "assistant";
+    spaced.content = "first\n\nsecond\n";
+    one.clear();
+    one.push_back(spaced);
+    TINYCA_CHECK_EQ(render_restored_conversation(one, tinyca::Appearance()),
+                    std::string("first\n\nsecond\n"));
+
+    // Unstyled output is plain text, with no stray resets.
+    const std::string plain = render_restored_conversation(history, tinyca::Appearance());
+    TINYCA_CHECK(plain.find("\x1b") == std::string::npos);
+    TINYCA_CHECK(plain.find("> count the files\n") != std::string::npos);
+}
+
+void test_restored_conversation_of_a_fresh_session_is_empty()
+{
+    tinyca::Appearance style;
+    std::vector<tinyca::Message> history;
+    tinyca::Message system;
+    system.role = "system";
+    system.content = "You are TinyCA.";
+    history.push_back(system);
+    // Nothing has been said yet: a banner with nothing under it would read as
+    // a session that lost its history.
+    TINYCA_CHECK_EQ(render_restored_conversation(history, style), std::string(""));
+
+    // An empty assistant turn (the model returned nothing) contributes no
+    // blank line either.
+    tinyca::Message empty_reply;
+    empty_reply.role = "assistant";
+    history.push_back(empty_reply);
+    TINYCA_CHECK_EQ(render_restored_conversation(history, style), std::string(""));
+}
+
 void run_all_tests()
 {
     TINYCA_RUN(test_missing_file_is_reported_not_crashed);
@@ -218,6 +315,8 @@ void run_all_tests()
     TINYCA_RUN(test_describe_prompt_difference);
     TINYCA_RUN(test_option_changes_are_recovered_and_the_latest_one_wins);
     TINYCA_RUN(test_untouched_and_malformed_options_leave_the_default_alone);
+    TINYCA_RUN(test_restored_conversation_shows_the_turns_in_their_own_colours);
+    TINYCA_RUN(test_restored_conversation_of_a_fresh_session_is_empty);
 }
 
 } // namespace
